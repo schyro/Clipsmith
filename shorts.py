@@ -1,0 +1,526 @@
+"""Local, resumable Raw -> vertical clips pipeline. See README.md."""
+from __future__ import annotations
+import argparse
+import functools
+from dataclasses import asdict
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from captions import write_captions
+
+ROOT = Path(__file__).resolve().parent
+VERSION = 5
+EXTENSIONS = {'.mp4', '.mov', '.mkv', '.m4v', '.webm'}
+
+
+def run(args):
+    result = subprocess.run([str(a) for a in args], capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if result.returncode:
+        raise RuntimeError(result.stderr[-5000:] or result.stdout[-5000:])
+    return result.stdout
+
+
+def write_json(path, data):
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(path)
+
+
+def probe(path):
+    return json.loads(run(['ffprobe', '-v', 'error', '-show_format', '-show_streams', '-of', 'json', path]))
+
+
+def _head_tail_hash(path, prefix):
+    size = path.stat().st_size
+    h = hashlib.sha256(prefix.encode())
+    with path.open('rb') as stream:
+        h.update(stream.read(1024 * 1024))
+        stream.seek(max(0, size - 1024 * 1024))
+        h.update(stream.read())
+    return h.hexdigest()[:12]
+
+
+def source_id(path):
+    """Content-based id: renaming, copying or touching a file keeps its plans and caches."""
+    return _head_tail_hash(path, f'{path.stat().st_size}')
+
+
+def legacy_source_id(path):
+    """The earlier id, which also hashed the file name and modification time."""
+    stat = path.stat()
+    return _head_tail_hash(path, f'{path.name}|{stat.st_size}|{stat.st_mtime_ns}')
+
+
+def migrate_source_id(source, new_id, root=None):
+    """Move plans, caches, review files and outputs from the legacy id to the new one."""
+    root = Path(root or ROOT)
+    old_id = legacy_source_id(source)
+    if old_id == new_id or (root/'Plans'/f'{new_id}.json').exists():
+        return False
+    moves = [(root/'work'/old_id, root/'work'/new_id), (root/'Review'/old_id, root/'Review'/new_id),
+             (root/'Plans'/f'{old_id}.json', root/'Plans'/f'{new_id}.json')]
+    moves += [(folder, folder.with_name(folder.name[:-len(old_id[:6])]+new_id[:6]))
+              for folder in (root/'Output').glob(f'*_{old_id[:6]}') if folder.is_dir()]
+    moves = [(a, b) for a, b in moves if a.exists()]
+    if not moves:
+        return False
+    for a, b in moves:
+        if b.exists():
+            raise ValueError(f'Cannot migrate {a} to {b}: the destination already exists.')
+    for a, b in moves:
+        a.rename(b)
+    def retag(path):
+        if path.exists():
+            data = json.loads(path.read_text(encoding='utf-8-sig'))
+            if isinstance(data, dict) and data.get('source_id') == old_id:
+                data['source_id'] = new_id
+                write_json(path, data)
+    retag(root/'Plans'/f'{new_id}.json')
+    for folder in (root/'Output').glob(f'*_{new_id[:6]}/*'):
+        retag(folder/'plan.json')
+        retag(folder/'review-decisions.json')
+    print(f'Migrated source id {old_id} -> {new_id}: {source.name}', flush=True)
+    return True
+
+
+def raw_sources():
+    raw = ROOT/'Raw'
+    raw.mkdir(exist_ok=True)
+    return sorted(p for p in raw.iterdir() if p.suffix.lower() in EXTENSIONS)
+
+
+def migrate_all():
+    """Bring every Raw source's folders to its content-based id."""
+    for source in raw_sources():
+        migrate_source_id(source, source_id(source))
+
+
+def find_source(wanted):
+    for source in raw_sources():
+        if source_id(source) == wanted:
+            return source
+    raise ValueError(f'No video in Raw has source id {wanted}.')
+
+
+def transcribe(source, cache, model_name, task='transcribe'):
+    suffix = '-english' if task == 'translate' else ''
+    dest = cache / f'transcript-{model_name}{suffix}.json'
+    if dest.exists():
+        cached = json.loads(dest.read_text(encoding='utf-8'))
+        cached.setdefault('model',model_name)
+        cached.setdefault('task',task)
+        return cached
+    from faster_whisper import WhisperModel
+    print(f'Transcribing: {source.name} ({model_name}, CPU)', flush=True)
+    model = WhisperModel(model_name, device='cpu', compute_type='int8', cpu_threads=min(8, os.cpu_count() or 4))
+    segments, info = model.transcribe(str(source), task=task, word_timestamps=True, vad_filter=True,
+                                      beam_size=5, condition_on_previous_text=False)
+    data = {'language': 'en' if task=='translate' else info.language, 'source_language': info.language,
+            'model': model_name, 'task': task, 'segments': []}
+    with (cache / f'transcript-{model_name}{suffix}.txt').open('w', encoding='utf-8') as out:
+        for segment in segments:
+            data['segments'].append(asdict(segment))
+            out.write(f'{segment.start:.2f} - {segment.end:.2f}: {segment.text.strip()}\n')
+            out.flush()
+            print(f'  {segment.end:.0f} seconds processed', flush=True)
+    write_json(dest, data)
+    return data
+
+
+def english_transcript(source, cache, model_name):
+    original = transcribe(source,cache,model_name)
+    result = original if original['language']=='en' else transcribe(source,cache,model_name,'translate')
+    edits_path = cache/f'caption-edits-{model_name}.json'
+    if edits_path.exists():
+        import copy
+        result = copy.deepcopy(result)
+        edits = json.loads(edits_path.read_text(encoding='utf-8-sig'))
+        if edits.get('model') != model_name:
+            raise ValueError('Caption corrections belong to a different model.')
+        words = [w for s in result['segments'] for w in s.get('words',[])]
+        for edit in edits['edits']:
+            word = words[edit['index']]
+            if word['word'].strip() != edit['from']:
+                raise ValueError(f'Caption correction source word mismatch: {edit}')
+            word['word'] = ' '+edit['to']
+    return result
+
+
+def settings():
+    config = json.loads((ROOT/'video_settings.json').read_text(encoding='utf-8'))
+    if config['width']%2 or config['height']%2 or not 0 < config['picture_height'] <= config['height']:
+        raise ValueError('Invalid video dimensions.')
+    return config
+
+
+def sentences(transcript):
+    """Use word timing and real pauses rather than fixed-length chopping."""
+    words = []
+    for segment in transcript['segments']:
+        words.extend(segment.get('words') or [{'start': segment['start'], 'end': segment['end'], 'word': segment['text']}])
+    result, group = [], []
+    for i, word in enumerate(words):
+        group.append(word)
+        pause = i == len(words)-1 or words[i+1]['start'] - word['end'] > .75
+        if pause or re.search(r'[.!?]["\u201d\u2019]*$', word['word'].strip()):
+            result.append({'start': group[0]['start'], 'end': group[-1]['end'],
+                           'text': ''.join(w['word'] for w in group).strip()})
+            group = []
+    return result
+
+
+def propose(transcript, duration, count):
+    """Offline heuristic, not a semantic/virality model. Plans remain editable."""
+    units = sentences(transcript)
+    candidates = []
+    hooks = r'\b(why|how|what|secret|dead|killer|murder|truth|lie|money|million|never|actually|wrong|imagine)\b'
+    for i, first in enumerate(units):
+        if first['start'] < 3 or first['start'] > duration - 20:
+            continue
+        # A bare reply such as "A what?" needs the previous speaker's context.
+        if len(first['text'].split()) < 5:
+            continue
+        possible = []
+        for j in range(i, len(units)):
+            # Treat a long dialogue break as a section boundary. Do not join an
+            # interrogation to an unrelated scene merely to fill the duration.
+            if j > i and units[j]['start'] - units[j-1]['end'] >= 2.5:
+                break
+            length = units[j]['end'] - first['start']
+            if length > 58:
+                break
+            if length >= 24:
+                possible.append(j)
+        if not possible:
+            continue
+        # Prefer endings after a sentence and before a pause.
+        j = max(possible, key=lambda k: min(2, units[k+1]['start']-units[k]['end']) if k+1 < len(units) else 2)
+        text = ' '.join(u['text'] for u in units[i:j+1])
+        length = units[j]['end'] - first['start']
+        speech = sum(u['end']-u['start'] for u in units[i:j+1]) / length
+        score = len(re.findall(hooks, text.lower())) + 2 * len(re.findall(hooks, first['text'].lower()))
+        score += 1.5 * ('?' in first['text']) + speech * 2
+        score -= 2 * bool(re.match(r'^(and|but|so|he|she|it)\b', first['text'], re.I))
+        candidates.append({'start': max(0, round(first['start']-.18, 2)),
+                           'end': min(duration, round(units[j]['end']+.3, 2)),
+                           'title': ' '.join(first['text'].split()[:12]),
+                           'reason': 'Local keyword, question and speech-density score; heuristic proposal.',
+                           'score': round(score, 2)})
+    chosen = []
+    ranked = sorted(candidates, key=lambda c: c['score'], reverse=True)
+    for clip in ranked:
+        if count is None and clip['score'] < max(3.5, ranked[0]['score']*.55):
+            break
+        if all(clip['end']+3 <= c['start'] or clip['start'] >= c['end']+3 for c in chosen):
+            chosen.append(clip)
+        if count is not None and len(chosen) == count:
+            break
+    if not chosen:
+        raise ValueError('Not enough speech was found. Create a reviewed start/end plan under Plans.')
+    return chosen
+
+
+def validate_plan(plan, fingerprint, duration):
+    if plan.get('source_id') != fingerprint:
+        raise ValueError('The plan belongs to a different source (source_id mismatch).')
+    if not plan.get('clips'):
+        raise ValueError('The plan is empty.')
+    ids = [c['id'] for c in plan['clips']+plan.get('rejected_clips',[]) if 'id' in c]
+    if len(ids) != len(set(ids)) or any(not re.fullmatch(r'\d{2,}', i) for i in ids):
+        raise ValueError('Clip ids must be unique numbers such as "01".')
+    for clip in plan['clips']:
+        start, end = float(clip['start']), float(clip['end'])
+        if not (0 <= start < end <= duration + .05):
+            raise ValueError(f'Invalid time range: {clip}')
+        if end-start > 180:
+            raise ValueError('A clip cannot exceed 180 seconds.')
+        if not 0 <= clip.get('crop_x',.5) <= 1:
+            raise ValueError('crop_x must be between 0 and 1.')
+        previous_end=0
+        if clip.get('framing_overrides'):
+            raise ValueError('Legacy zoom overrides are unsupported. Use frame-indexed focus_overrides.')
+        for override in sorted(clip.get('focus_overrides',[]),key=lambda o:o['start_frame']):
+            a,b=override['start_frame'],override['end_frame']
+            if not (isinstance(a,int) and isinstance(b,int) and previous_end<=a<b<=math.ceil((end-start)*30-1e-9)):
+                raise ValueError('Focus overrides must use non-overlapping frame indices inside the clip.')
+            if not 0<=override['center_x']<=1:
+                raise ValueError('Focus center_x must be between 0 and 1.')
+            if not 0<=override.get('center_x_end',override['center_x'])<=1:
+                raise ValueError('Focus center_x_end must be between 0 and 1.')
+            previous_end=b
+
+
+def verify(path, expected, config=None):
+    config = config or settings()
+    data = probe(path)
+    video = next(s for s in data['streams'] if s['codec_type']=='video')
+    audio = next((s for s in data['streams'] if s['codec_type']=='audio'), None)
+    if (video['width'], video['height']) != (config['width'],config['height']) or not audio:
+        raise ValueError(f'Output validation failed: {path}')
+    if abs(float(data['format']['duration'])-expected)>.3:
+        raise ValueError(f'Unexpected output duration: {path}')
+    return data
+
+
+@functools.lru_cache(maxsize=1)
+def nvenc_available():
+    """Probe the GPU encoder once, so a real filter error is never retried silently."""
+    try:
+        run(['ffmpeg','-v','error','-f','lavfi','-i','color=black:s=256x256:d=0.1','-c:v','h264_nvenc','-f','null','-'])
+        return True
+    except RuntimeError:
+        print('GPU encoding is unavailable; using the CPU encoder.', flush=True)
+        return False
+
+
+def filter_path(path):
+    return str(Path(path).resolve()).replace('\\','/').replace(':','\\:').replace("'", "'\\''")
+
+
+def ensure_clip_ids(plan):
+    """Give every clip a permanent id. Existing clips keep their plan position as
+    id; new clips get the next unused number, so removing one renames nothing."""
+    used = [int(c['id']) for c in plan['clips']+plan.get('rejected_clips',[]) if 'id' in c]
+    changed = False
+    for position, clip in enumerate(plan['clips'], 1):
+        if 'id' not in clip:
+            number = position if not used else max(used)+1
+            while number in used:
+                number += 1
+            clip['id'] = f'{number:02}'
+            used.append(number)
+            changed = True
+    return changed
+
+
+def clip_stem(clip):
+    slug = re.sub(r'[^\w-]+','_',clip['title'],flags=re.UNICODE).strip('_')[:64]
+    return f"{clip['id']}_{slug}"
+
+
+# Plan fields that do not change the rendered pixels or sound.
+NON_RENDER_KEYS = {'id','title','reason','approved','cover_time'}
+
+
+def render_signature(clip, config, framing, captions):
+    framing = {k: v for k, v in framing.items() if k != 'commands_path'}
+    return hashlib.sha256(json.dumps({'clip':{k: v for k, v in clip.items() if k not in NON_RENDER_KEYS},
+                                      'version':VERSION,'settings':config,'reframe':framing,'captions':captions,
+                                      'font':hashlib.sha256((ROOT/'assets/fonts/Dosis-Bold.ttf').read_bytes()).hexdigest()},
+                                     sort_keys=True).encode()).hexdigest()
+
+
+def is_locked(clip, dest, force):
+    """An approved clip keeps its finished file until --force or the approval is withdrawn."""
+    return bool(clip.get('approved')) and not force and dest.exists() and dest.with_suffix('.done.json').exists()
+
+
+def render(source, clip, dest, cache, force, transcript=None, config=None):
+    config = config or settings()
+    if transcript is None:
+        raise ValueError('Rendering requires a word-timed English transcript.')
+    if is_locked(clip, dest, force):
+        verify(dest, clip['end']-clip['start'], config)
+        print(f'Approved and locked: {dest.name}', flush=True)
+        return
+    ass = cache/(dest.stem+'-en.ass')
+    write_captions(transcript,clip,ass,dest.with_suffix('.en.srt'),config)
+    from speaker_focus import focus_plan
+    from focus_review import write_focus_sheet
+    framing = focus_plan(source,clip,cache,config,transcript)
+    write_json(dest.with_suffix('.focus.json'),framing)
+    digest = render_signature(clip, config, framing, ass.read_text(encoding='utf-8-sig'))
+    marker = dest.with_suffix('.done.json')
+    sheet = ROOT/'Review'/cache.name/'focus'/(dest.stem+'.jpg')
+    if not force and dest.exists() and marker.exists() and json.loads(marker.read_text())['signature']==digest:
+        verify(dest, clip['end']-clip['start'],config)
+        if not sheet.exists():
+            write_focus_sheet(source,clip,framing,sheet,config['width'])
+        print(f'Already complete: {dest.name}', flush=True)
+        return
+    write_focus_sheet(source,clip,framing,sheet,config['width'])
+    temp = dest.with_name(dest.stem+'.partial.mp4')
+    duration = clip['end']-clip['start']
+    from media_filters import audio_filters,video_filters
+    graph = video_filters(framing,clip,config,ass,ROOT/'assets/fonts')
+    command = ['ffmpeg','-hide_banner','-loglevel','error','-y','-ss',clip['start'],'-i',source,
+               '-t',duration,'-filter_complex',graph,
+               '-map','[v]','-map','0:a:0','-af',audio_filters(duration,config),
+               '-c:a','aac','-b:a','192k','-ar','48000','-pix_fmt','yuv420p',
+               '-movflags','+faststart','-map_metadata','-1']
+    if nvenc_available():
+        run(command+['-c:v','h264_nvenc','-preset','p4','-rc','vbr','-cq','20','-b:v','0',temp])
+    else:
+        run(command+['-c:v','libx264','-preset','veryfast','-crf','20',temp])
+    data = verify(temp,duration,config)
+    # Decode every output frame/audio packet before marking complete.
+    run(['ffmpeg','-v','error','-xerror','-i',temp,'-f','null','-'])
+    temp.replace(dest)
+    write_json(marker, {'signature':digest,'duration':data['format']['duration']})
+
+
+CLIP_SUFFIXES = ('.mp4','.jpg','.en.srt','.done.json','.focus.json')
+
+
+def clip_files(folder, stem):
+    return [folder/(stem+suffix) for suffix in CLIP_SUFFIXES if (folder/(stem+suffix)).exists()]
+
+
+def tidy_outputs(output, plan):
+    """Delete superseded files of a clip whose title changed, and move files of
+    clips that are no longer in the plan into rejected/."""
+    current = {clip_stem(c) for c in plan['clips']}
+    ids = {c['id'] for c in plan['clips']}
+    for path in sorted(output.glob('*.mp4')):
+        stem = path.stem
+        match = re.match(r'(\d{2,})_', stem)
+        if stem in current or not match or stem.endswith('.partial'):
+            continue
+        files = clip_files(output, stem)
+        if match.group(1) in ids:
+            for f in files:
+                f.unlink()
+            print(f'Removed superseded files: {stem}', flush=True)
+        else:
+            archive = output/'rejected'
+            archive.mkdir(exist_ok=True)
+            for f in files:
+                f.replace(archive/f.name)
+            print(f'Moved to rejected/: {stem} (no longer in the plan)', flush=True)
+
+
+def output_folder(plan, config):
+    # Named after the plan's original source name, so renaming the Raw file moves nothing.
+    return ROOT/'Output'/(Path(plan['source']).stem+'_'+plan['source_id'][:6])/config['profile']
+
+
+def render_plan(source, plan, cache, config, force, model='medium'):
+    """Render every clip of a validated plan; return the output folder."""
+    output = output_folder(plan, config)
+    output.mkdir(parents=True,exist_ok=True)
+    write_json(output/'plan.json',plan)
+    index = []
+    transcript = english_transcript(source,cache,model)
+    for number,clip in enumerate(plan['clips'],1):
+        dest = output/(clip_stem(clip)+'.mp4')
+        print(f'Clip {number}/{len(plan["clips"])} [{clip["id"]}]: {clip["title"]} ({clip["end"]-clip["start"]:.1f}s)',flush=True)
+        render(source,clip,dest,cache,force,transcript,config)
+        cover = dest.with_suffix('.jpg')
+        if not is_locked(clip, dest, force) or not cover.exists():
+            run(['ffmpeg','-v','error','-y','-ss',min(clip.get('cover_time',2),clip['end']-clip['start']-.1),'-i',dest,'-frames:v','1','-update','1',cover])
+        index.append({**clip,'file':dest.name})
+    tidy_outputs(output, plan)
+    write_json(output/'clips.json',index)
+    from gallery import write_gallery
+    write_gallery(output,ROOT,index,plan)
+    print(f'Completed: {output}',flush=True)
+    write_json(cache/'last-render.json',{'profile':config['profile'],'output':str(output),'clips':len(index)})
+    return output
+
+
+def load_plan(plan_path, fingerprint, duration):
+    plan = json.loads(plan_path.read_text(encoding='utf-8-sig'))
+    if ensure_clip_ids(plan):
+        write_json(plan_path, plan)
+    validate_plan(plan,fingerprint,duration)
+    return plan
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, help='Default: all videos in the Raw folder')
+    parser.add_argument('--count', type=int, default=None, help='Optional proposal count limit; no fixed limit by default')
+    parser.add_argument('--model', default='medium', choices=['tiny','base','small','medium','large-v3'])
+    parser.add_argument('--plan', type=Path)
+    parser.add_argument('--analyze-only', action='store_true')
+    parser.add_argument('--force', action='store_true')
+    parser.add_argument('--prepare-review', action='store_true', help='Prepare the full transcript and timestamped frames for editorial review')
+    parser.add_argument('--require-reviewed', action='store_true', help='Require an editorially reviewed plan before rendering')
+    parser.add_argument('--review-gallery', nargs='?', const='', metavar='OUTPUT', help='Open the clip editor for an output folder and record decisions (default: latest output folder)')
+    parser.add_argument('--write-gallery', nargs='?', const='', metavar='OUTPUT', help='Regenerate only index.html for an output folder (default: latest)')
+    parser.add_argument('--apply-review', nargs='?', const='', metavar='OUTPUT', help='Apply gallery decisions to the plan and re-render changed clips (default: latest output folder)')
+    parser.add_argument('--port', type=int, default=8765, help='Clip editor port')
+    parser.add_argument('--no-open', action='store_true', help='Do not open a browser for --review-gallery')
+    args = parser.parse_args()
+    migrate_all()
+    if args.apply_review is not None:
+        from gallery import latest_output
+        from review_apply import apply_review
+        output = Path(args.apply_review).resolve() if args.apply_review else latest_output(ROOT)
+        apply_review(output, ROOT, settings(), args.force, args.model)
+        return 0
+    if args.review_gallery is not None or args.write_gallery is not None:
+        from gallery import latest_output, write_gallery
+        target = args.review_gallery if args.review_gallery is not None else args.write_gallery
+        output = Path(target).resolve() if target else latest_output(ROOT)
+        if not (output/'clips.json').exists():
+            parser.error(f'No clips.json in {output}')
+        if args.write_gallery is not None:
+            print(f'Gallery written: {write_gallery(output,ROOT)}',flush=True)
+        else:
+            from editor_server import serve
+            serve(ROOT,output,args.port,not args.no_open)
+        return 0
+    if args.count is not None and not 1 <= args.count <= 200:
+        parser.error('--count must be between 1 and 200')
+    config = settings()
+    review_entries = []
+    sources = [args.input.resolve()] if args.input else raw_sources()
+    if not sources:
+        raise ValueError('No videos were found in the Raw folder. Copy your recordings into Raw/ and run again.')
+    if args.plan and len(sources)!=1:
+        parser.error('Use --input to select one video when passing --plan')
+    failures = []
+    for source in sources:
+        try:
+            fingerprint = source_id(source)
+            migrate_source_id(source, fingerprint)  # also covers --input outside Raw
+            cache = ROOT/'work'/fingerprint
+            cache.mkdir(parents=True,exist_ok=True)
+            plans = ROOT/'Plans'
+            plans.mkdir(exist_ok=True)
+            plan_path = args.plan or plans/(fingerprint+'.json')
+            data = probe(source)
+            if not any(s['codec_type']=='audio' for s in data['streams']):
+                raise ValueError('This speech-based workflow requires an audio stream.')
+            duration = float(data['format']['duration'])
+            if args.prepare_review:
+                from review import prepare_review
+                transcript = english_transcript(source,cache,args.model)
+                review_entries.append(prepare_review(source,fingerprint,cache,transcript,duration,plan_path))
+                continue
+            if plan_path.exists():
+                plan = load_plan(plan_path,fingerprint,duration)
+            else:
+                if args.require_reviewed:
+                    raise ValueError('No reviewed plan exists. Run --prepare-review and prepare a Plans JSON file first.')
+                transcript = transcribe(source,cache,args.model)
+                plan = {'source':source.name,'source_id':fingerprint,'selection':'offline-heuristic',
+                        'clips':propose(transcript,duration,args.count)}
+                ensure_clip_ids(plan)
+                validate_plan(plan,fingerprint,duration)
+                write_json(plan_path,plan)
+            if args.require_reviewed and plan.get('selection') not in ('editor-reviewed','agent-reviewed'):
+                raise ValueError('The plan has not been editorially reviewed.')
+            if args.analyze_only:
+                print(f'Plan ready: {plan_path}',flush=True)
+                continue
+            render_plan(source,plan,cache,config,args.force,args.model)
+        except Exception as exc:
+            print(f'ERROR — {source.name}: {exc}',file=sys.stderr,flush=True)
+            failures.append(source)
+    if args.prepare_review:
+        review_root = ROOT/'Review'
+        review_root.mkdir(exist_ok=True)
+        write_json(review_root/'manifest.json',{'sources':review_entries,'failures':[str(p) for p in failures]})
+        print(f'Review manifest: {review_root/"manifest.json"}',flush=True)
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

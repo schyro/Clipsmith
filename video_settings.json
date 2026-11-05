@@ -1,0 +1,19 @@
+{
+  "profile": "4x5-dosis-speaker-v4",
+  "width": 1080,
+  "height": 1350,
+  "picture_height": 1350,
+  "auto_reframe": true,
+  "framing_mode": "active-speaker-fixed-crop",
+  "font": "Dosis",
+  "font_size": 64,
+  "subtitle_y": 675,
+  "highlight": "&H0068E8FF",
+  "max_caption_words": 5,
+  "audio_fade_ms": 20,
+  "caption_fade_in_ms": 70,
+  "caption_fade_out_ms": 40,
+  "caption_settle_ms": 100,
+  "caption_start_scale": 98,
+  "speaker_switch_min_seconds": 1.5
+}

@@ -1,0 +1,12 @@
+.venv/
+Raw/
+Output/
+work/
+Review/
+__pycache__/
+*.pyc
+
+# Personal data: your own plans and session notes stay local.
+Plans/*.json
+.claude/settings.local.json
+.claude/launch.json

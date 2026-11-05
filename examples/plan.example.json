@@ -1,0 +1,28 @@
+{
+  "source": "my-recording.mp4",
+  "source_id": "0123456789ab",
+  "selection": "agent-reviewed",
+  "review_note": "Full transcript and contact sheets reviewed; two standalone scenes selected.",
+  "clips": [
+    {
+      "id": "01",
+      "start": 94.95,
+      "end": 128.75,
+      "title": "The big reveal",
+      "reason": "Complete setup and payoff: the question is asked and answered inside the clip.",
+      "cover_time": 5,
+      "focus_overrides": [
+        {"start_frame": 21, "end_frame": 264, "center_x": 0.43, "reason": "Speaker is partly occluded; centre reviewed by hand."}
+      ]
+    },
+    {
+      "id": "02",
+      "start": 310.2,
+      "end": 352.0,
+      "title": "Fixed crop example",
+      "reason": "Wide two-shot where a fixed centre crop works better than following faces.",
+      "auto_reframe": false,
+      "crop_x": 0.5
+    }
+  ]
+}
