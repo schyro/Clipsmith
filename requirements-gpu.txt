@@ -1,0 +1,5 @@
+# Optional NVIDIA libraries that let faster-whisper (CTranslate2) transcribe on the GPU:
+# cuBLAS for CUDA 12 and cuDNN 9. run.cmd / run.sh install them only when nvidia-smi
+# is available. Without them, or if the GPU fails, transcription uses the CPU.
+nvidia-cublas-cu12==12.9.1.4; sys_platform == "win32" or sys_platform == "linux"
+nvidia-cudnn-cu12==9.28.0.42; sys_platform == "win32" or sys_platform == "linux"

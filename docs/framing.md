@@ -37,4 +37,6 @@ Occluded, very small or low-confidence faces still require editorial review. Eac
 }
 ```
 
+Agent-reviewed plans also carry a `coverage` list with one note per `review.md` block; see AGENTS.md, step 3, and `examples/plan.example.json`.
+
 Frame intervals are clip-relative and half-open: start_frame is included and end_frame is excluded. `center_x` is the source horizontal position from 0 to 1. Optional `center_x_end` creates a gentle reviewed pan inside the same shot. Overrides cannot overlap or cross a camera cut. They do not change crop size or aspect ratio. Legacy zoom-based `framing_overrides` are rejected. Set a clip's `auto_reframe` to `false` to use its fixed `crop_x` instead.

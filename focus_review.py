@@ -32,8 +32,10 @@ def write_focus_sheet(source, clip, focus, dest, output_width):
     if not picks:
         return None
     select = '+'.join(f'eq(n\\,{p[0]})' for p in picks)
-    command = ['ffmpeg', '-v', 'error', '-ss', str(clip['start']), '-i', str(source),
-               '-t', str(clip['end']-clip['start']), '-an',
+    # -t must limit the input: select drops the frames after the last pick, so an
+    # output limit is never reached and ffmpeg would decode the rest of the source.
+    command = ['ffmpeg', '-v', 'error', '-ss', str(clip['start']), '-t', str(clip['end']-clip['start']),
+               '-i', str(source), '-an',
                '-vf', f"setpts=PTS-STARTPTS,fps=30,select='{select}',scale={TILE_W}:{TILE_H}",
                '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
     raw = subprocess.run(command, capture_output=True, check=True).stdout

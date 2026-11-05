@@ -27,6 +27,26 @@ if [ ! -f "$stamp" ] || [ "$(tr -d '[:space:]' < "$stamp")" != "$hash" ]; then
     echo "$hash" > "$stamp"
 fi
 
+# With an NVIDIA GPU, also install the CUDA libraries for GPU transcription.
+# Set CLIPSMITH_WHISPER_DEVICE=cpu to skip this and transcribe on the CPU.
+if command -v nvidia-smi >/dev/null 2>&1 && [ "${CLIPSMITH_WHISPER_DEVICE:-}" != cpu ]; then
+    gpu_hash=$(.venv/bin/python -c "import hashlib; from pathlib import Path; print(hashlib.sha256(Path('requirements-gpu.txt').read_bytes()).hexdigest())")
+    gpu_stamp=.venv/shorts-gpu-requirements.sha256
+    if [ ! -f "$gpu_stamp" ] || [ "$(tr -d '[:space:]' < "$gpu_stamp")" != "$gpu_hash" ]; then
+        echo 'NVIDIA GPU found: installing the CUDA libraries for GPU transcription (about 1.3 GB, once).'
+        if .venv/bin/python -m pip install -r requirements-gpu.txt; then
+            echo "$gpu_hash" > "$gpu_stamp"
+        else
+            echo 'Could not install the CUDA libraries; transcription will use the CPU.' >&2
+        fi
+    fi
+    # CTranslate2 loads cuBLAS and cuDNN through the dynamic loader path.
+    cuda_libs=$(.venv/bin/python -c "import glob, os, nvidia; print(':'.join(sorted({p for base in nvidia.__path__ for p in glob.glob(os.path.join(base, '*', 'lib'))})))" 2>/dev/null || true)
+    if [ -n "$cuda_libs" ]; then
+        export LD_LIBRARY_PATH="$cuda_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+fi
+
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1
 export PYTHONIOENCODING=utf-8
 exec .venv/bin/python -u shorts.py "$@"

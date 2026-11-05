@@ -2,7 +2,7 @@
 
 Turn long recordings into short, captioned vertical clips for Shorts, Reels and TikTok, with an AI agent as your editor.
 
-You drop a video into `Raw/` and tell your AI coding agent (Codex, Claude Code, Cursor, Gemini CLI, Copilot, ...) that you added it. The agent reads the full transcript and picks every scene that stands on its own. Clipsmith then cuts and frames those scenes and burns in the captions. Everything runs on your own computer. No API key is needed.
+You drop a video into `Raw/` and tell your AI coding agent (Codex, Claude Code, Cursor, Gemini CLI, Copilot, ...) that you added it. The agent reads the full transcript and picks every moment with short-form potential (funny, surprising, tense, emotional or quotable) as a 20–60 second candidate, and you keep the ones you like. Clipsmith then cuts and frames those clips and burns in the captions. Everything runs on your own computer. No API key is needed.
 
 ## What you get
 
@@ -17,7 +17,7 @@ You drop a video into `Raw/` and tell your AI coding agent (Codex, Claude Code, 
 - [FFmpeg](https://ffmpeg.org/download.html), with `ffmpeg` and `ffprobe` on your PATH
 - An AI coding agent that can run commands in this folder
 
-The first run creates a local `.venv` and installs everything else. It also downloads the Whisper model once (about 1.5 GB). An NVIDIA GPU speeds up encoding but is not required.
+The first run creates a local `.venv` and installs everything else. It also downloads the Whisper model once (about 1.5 GB). An NVIDIA GPU is optional: when `nvidia-smi` is available, the first run also installs the CUDA libraries for transcription (about 1.25 GB), and transcription and encoding run on the GPU.
 
 ## Quick start
 

@@ -9,17 +9,34 @@ You, the agent in the chat, are the editor: you read the transcripts and pick th
 Carry the job through to verified MP4 files. A running process is not completion.
 
 1. **Prepare.** Run `run --prepare-review` and wait for it. `Review/manifest.json` lists, per source, the full dialogue (`review.md`), global word indices and times (`words.json`) and timestamped contact sheets.
-2. **Select.** For each entry that needs review, read the complete `review.md` and look at the contact sheets. Pick every distinct scene that works on its own: a strong opening, an understandable setup and a completed payoff. There is no fixed clip count. Do not turn every line into a clip, and avoid duplicate or overlapping moments. Reuse an existing reviewed plan unless the user asks for a new selection.
+2. **Select.** For each entry that needs review, read the complete `review.md` and look at the contact sheets. You are building a pool of candidates for short-form social video (Shorts, Reels, TikTok). The user picks the winners, so when in doubt, include the moment. Do not ask the user for a clip count or length; the rules below are the default.
+   - **What qualifies:** any moment that would make someone stop scrolling, watch to the end, replay it, comment on it or send it to a friend, for whatever reason. It must make sense to someone who has not seen the rest of the recording. Look for every kind:
+     - *Funny:* jokes, banter, comebacks, sarcasm, comic timing, absurd or awkward situations, someone being caught out or put in their place.
+     - *Emotional:* grief, love, regret, confessions, vulnerability, comfort, kindness, forgiveness, goodbyes and reunions, someone opening up about their past.
+     - *Motivational and inspiring:* advice and life lessons, encouragement, wisdom about purpose, failure, success or perseverance, someone finding courage, standing up for themselves or others, or doing the right thing at a cost.
+     - *Tension:* confrontations, arguments, threats, interrogations, ultimatums, power plays, someone losing their temper.
+     - *Surprise:* reveals, twists, exposed lies, unexpected answers, someone turning out to be far smarter or worse than expected.
+     - *Clever:* deductions, tricks, cold reads, sharp observations, explanations that make the viewer feel smart.
+     - *Quotable or debatable:* a line people would put in a caption, a bold or controversial opinion, a question viewers would argue about in the comments.
+     - *Relatable:* everyday frustrations and family, work or relationship moments that viewers recognise from their own lives.
+     - *Character and chemistry:* a strong introduction, flirting, friendship, rivalry, a moment that shows who someone really is.
+     - *Spectacle:* action, stunts or striking images the contact sheets show, even with little dialogue.
+   - **Length:** most clips 20–60 s, ideally 30–50 s. A single line with a clear payoff can be 10–20 s. Go up to 90 s only when the payoff needs that much build-up, never more unless the user asks. Split a long scene into its separate beats instead of keeping it whole.
+   - **Shape:** start on the hook, the line or question that makes someone stop scrolling, as late as the setup still makes sense. End right after the payoff or the reaction to it. Leave out walk-ins, dead air and scene transitions.
+   - **Coverage:** go through the whole runtime in order, one `### Block` of `review.md` at a time, and check every kind above in each block. Write what you find into the plan's `coverage` (step 3). A block with no clip is a decision, not an oversight. There is no fixed count; as a check, dialogue-driven material usually gives at least one candidate per two minutes (20 or more for a 40-minute episode), and far fewer means moments were missed.
+   - One clip per moment: two clips never share a punchline. Neighbouring clips may share a few seconds of context.
+   - Reuse an existing reviewed plan unless the user asks for a new selection.
 3. **Write the plan** to `Plans/<source_id>.json` (see `examples/plan.example.json`):
    - `source`, `source_id`, `selection: "agent-reviewed"` and `clips`.
    - Each clip has `start` and `end` in source seconds, a short `title` (used only for file names and the gallery) and a `reason`.
-   - Check both edges against the word timestamps so no word is cut. Stay inside the source, keep clips at most 180 s.
+   - Check both edges against the word timestamps in `words.json` so no word is cut. Stay inside the source. 180 s is only the technical limit; the length rule above applies.
+   - `coverage`: one entry per `### Block` of `review.md`, `{"start": 600, "note": "..."}`, where `start` is the block's start in seconds (shown in its heading). The note says what happens in the block and which moments you took. A block with no clip also needs `why_not_more`: why nothing in it works on its own. When the plan has fewer clips than one per two minutes of runtime (rejected clips count), every block with a single clip needs a `why_not_more` too. Set the plan's `count_note` only when the user asked for fewer clips.
    - Optional: `cover_time` (seconds into the clip), `focus_overrides` (see Framing), `auto_reframe: false` with a fixed `crop_x` (0..1).
    - Never renumber clip `id`s. A new clip gets the next unused id.
-4. **Fix captions.** Look for evident recognition errors in the selected ranges, especially names. Write corrections to `work/<source_id>/caption-edits-medium.json` as `{"model":"medium","edits":[{"index":123,"from":"original","to":"corrected"}]}`. Keep the timing; never invent dialogue. Non-English sources are translated to English by Whisper; check the translation and timing.
-5. **Render.** Run `run --require-reviewed` and wait. A nonzero exit code is a failure: fix the cause, do not report a partial set as done.
-6. **Check.** Look at rendered frames, caption placement and timing in each distinct scene, and at `Review/<id>/focus/<clip>.jpg` plus every shot with a `review` flag in the clip's `.focus.json`.
-7. **Deliver.** Give the user the finished MP4 paths, clip count and durations, any real remaining limitation, and the review link from `run --review-gallery` (`http://127.0.0.1:8765/editor/`).
+4. **Fix captions.** Look for evident recognition errors in the selected ranges, especially names. Write corrections to `work/<source_id>/caption-edits-medium.json` as `{"model":"medium","edits":[{"index":123,"from":"original","to":"corrected"}]}`. Keep the timing; never invent dialogue. When the audio is unclear, keep the recognised word rather than guess. Non-English sources are translated to English by Whisper; check the translation and timing.
+5. **Render.** Run `run --require-reviewed` and wait. It first checks the plan (coverage, clip count, no edge inside a word), lists every problem at once and renders nothing until they are fixed; `run --require-reviewed --analyze-only` runs only that check. A nonzero exit code is a failure: fix the cause, do not report a partial set as done.
+6. **Check.** After rendering, `run --require-reviewed` validates every clip, writes `work/<id>/qa-current/sheet-NN.jpg` (rendered start, middle and end frames, labelled by clip id) and prints those sheets, the focus sheet folder and every shot flagged for framing. Look at all of them: caption placement and timing on the sheets, and each flagged shot in `Review/<id>/focus/<clip>.jpg`. Fix framing with `focus_overrides` where the crop misses the speaker, then render again. `verify_outputs.py` repeats the validation on its own.
+7. **Deliver.** Give the user the finished MP4 paths, the clip count, each clip's title and duration, any real remaining limitation, and the review link from `run --review-gallery` (`http://127.0.0.1:8765/editor/`).
 
 ## Output rules
 

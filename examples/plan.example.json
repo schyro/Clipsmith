@@ -2,7 +2,12 @@
   "source": "my-recording.mp4",
   "source_id": "0123456789ab",
   "selection": "agent-reviewed",
-  "review_note": "Full transcript and contact sheets reviewed; two standalone scenes selected.",
+  "review_note": "Full transcript and contact sheets reviewed block by block; every standalone moment with short-form potential selected (two are shown here).",
+  "coverage": [
+    {"start": 0, "note": "Cold open and the case set-up; the reveal at 1:35 is clip 01."},
+    {"start": 300, "note": "Argument in the kitchen, clip 02; the phone call after it needs the earlier scene."},
+    {"start": 600, "note": "Travel montage over music.", "why_not_more": "Only scattered single lines over music; none has a setup and a payoff of its own."}
+  ],
   "clips": [
     {
       "id": "01",

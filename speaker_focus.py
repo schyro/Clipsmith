@@ -9,11 +9,16 @@ Two stages:
 import hashlib
 import json
 import math
+import os
 import subprocess
 import tempfile
+import threading
 
 ANALYSIS_VERSION = 3
 FPS = 30
+# Face detection runs on this many threads, each with its own YuNet instance.
+# Results are identical to one sequential detector; only the speed changes.
+DETECT_WORKERS = max(1, min(4, (os.cpu_count() or 4)//4))
 
 
 def geometry(stream, config):
@@ -78,9 +83,10 @@ def analyze(source, clip, cache, config, stream):
         return json.loads(path.read_text(encoding='utf-8'))
     import cv2
     import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
     from python_speech_features import mfcc
     from scipy.io import wavfile
-    from active_speaker import analyze_shot
+    from active_speaker import analyze_shot, face_boxes
     duration = clip['end']-clip['start']
     print(f'Analyzing active speakers and exact cut frames: {clip["title"]}', flush=True)
     with tempfile.TemporaryDirectory() as tmp:
@@ -91,23 +97,37 @@ def analyze(source, clip, cache, config, stream):
     audio_features = mfcc(audio, rate, numcep=13, winlen=.025, winstep=.010)
     width = 640
     height = round(width*stream['height']/stream['width']/2)*2
-    detector = cv2.FaceDetectorYN.create(str(ROOT/'assets/models/face_detection_yunet_2023mar.onnx'),
-                                         '', (width, height), .65, .3, 5000)
+    model = str(ROOT/'assets/models/face_detection_yunet_2023mar.onnx')
+    local = threading.local()
+
+    def detect(frame):
+        if not hasattr(local, 'detector'):
+            local.detector = cv2.FaceDetectorYN.create(model, '', (width, height), .65, .3, 5000)
+        return face_boxes(local.detector, frame)
+
     cmd = ['ffmpeg', '-v', 'error', '-ss', str(clip['start']), '-i', str(source), '-t', str(duration),
            '-vf', f'setpts=PTS-STARTPTS,fps={FPS},scale={width}:{height}',
            '-an', '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-']
-    frames, shots = [], []
+    frames, boxes, shots = [], [], []
     first_frame = index = 0
-    previous = previous_hist = None
+    previous = previous_hist = previous_frame = previous_boxes = None
+    scoring = None
+
+    def score_shot(shot_frames, shot_boxes, start, number):
+        tracks = analyze_shot(shot_frames, start, [b.result() for b in shot_boxes], audio_features, width)
+        print(f'  Shot {number}: frames {start}..{start+len(shot_frames)-1}, {len(tracks)} tracks', flush=True)
+        return {'start_frame': start, 'end_frame': start+len(shot_frames), 'tracks': tracks}
 
     def finish_shot():
-        if frames:
-            tracks = analyze_shot(frames, first_frame, detector, audio_features, width)
-            shots.append({'start_frame': first_frame, 'end_frame': first_frame+len(frames), 'tracks': tracks})
-            print(f'  Shot {len(shots)}: frames {first_frame}..{first_frame+len(frames)-1}, '
-                  f'{len(tracks)} tracks', flush=True)
+        # One shot is scored in the background while the next one is decoded and
+        # detected; shots are still collected strictly in order.
+        nonlocal scoring
+        if scoring is not None:
+            shots.append(scoring.result())
+        scoring = scorer.submit(score_shot, frames, boxes, first_frame, len(shots)+1) if frames else None
 
-    with tempfile.TemporaryFile() as errors:
+    with tempfile.TemporaryFile() as errors, ThreadPoolExecutor(DETECT_WORKERS) as detectors, \
+            ThreadPoolExecutor(1) as scorer:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors)
         try:
             while True:
@@ -124,14 +144,22 @@ def analyze(source, clip, cache, config, stream):
                 # Every output frame is compared, so a cut is found on its exact frame.
                 if is_cut(previous, thumb, hist, previous_hist):
                     finish_shot()
-                    frames = []
+                    frames, boxes = [], []
                     first_frame = index
+                # Frame-rate conversion repeats source frames; a repeat has the same faces.
+                if previous_frame is None or not np.array_equal(frame, previous_frame):
+                    previous_boxes = detectors.submit(detect, frame)
                 frames.append(frame)
-                previous, previous_hist = thumb, hist
+                boxes.append(previous_boxes)
+                previous, previous_hist, previous_frame = thumb, hist, frame
                 index += 1
             finish_shot()
-        except Exception:
+            if scoring is not None:
+                shots.append(scoring.result())
+        except BaseException:
             process.kill(); process.wait()
+            detectors.shutdown(cancel_futures=True)
+            scorer.shutdown(cancel_futures=True)
             raise
         finally:
             process.stdout.close()

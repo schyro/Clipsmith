@@ -29,12 +29,25 @@ def prepare_review(source, fingerprint, cache, transcript, duration, plan_path):
     lines = [f'# {source.name}',f'Source ID: {fingerprint}',f'Duration: {duration:.3f} seconds',
              f'English word timestamps: {cache / ("transcript-"+transcript["model"]+("-english" if transcript.get("task")=="translate" else "")+".json")}',
              f'Plan destination: {plan_path}',
-             'Review the complete dialogue and contact sheets. Select all distinct compelling scenes, with no fixed clip count.',
+             'Review the complete dialogue and contact sheets, one block at a time. Select every moment with short-form '
+             'potential that makes sense on its own: funny, emotional, motivational or inspiring, tense, surprising, '
+             'clever, quotable or debatable, relatable, a strong character moment, or spectacle. The user picks the '
+             'winners, so include a moment when in doubt. There is no fixed clip count.',
+             'Most clips run 20-60 s, ideally 30-50 s; a one-line payoff can be 10-20 s; never more than 90 s unless the '
+             'user asks. Start on the hook and end right after the payoff. Full rules: AGENTS.md, step 2.',
+             'Give every block below a "coverage" entry in the plan, {"start": <block start>, "note": "..."}, plus '
+             '"why_not_more" where AGENTS.md, step 3 asks for it; the render refuses a plan without them.',
              'Check boundaries against word timing and nearby frames; do not cut off setup, payoff or a spoken word.',
              'Framing always fills 4:5 without widening or padding. Local Light-ASD scores synchronized audio/face tracks. Review uncertain speaker choices and use focus_overrides with exact clip-relative start_frame/end_frame (30 fps), center_x and optional center_x_end. Never cross a camera cut or target an offscreen face early. Per-clip focus sidecars list exact cut frames.',
              f'Caption corrections: {cache/("caption-edits-"+transcript["model"]+".json")}. Schema: {{"model":"'+transcript['model']+'","edits":[{"index":0,"from":"original stripped word","to":"corrected word"}]}. Indices are global, zero-based in words.json; preserve word times.',
              '', '## Contact sheets',*sheets,'','## Full English dialogue']
+    from selection import block_label, block_start
+    block = None
     for unit in sentences(transcript):
+        # Five-minute headings; the render's coverage check uses the same blocks.
+        if block_start(unit['start'], duration) != block:
+            block = block_start(unit['start'], duration)
+            lines += ['', f'### Block {block_label(block, duration)} (coverage start {block})', '']
         lines.append(f'{unit["start"]:.2f}–{unit["end"]:.2f}: {unit["text"]}')
     review_path = folder/'review.md'
     review_path.write_text('\n'.join(lines)+'\n',encoding='utf-8')

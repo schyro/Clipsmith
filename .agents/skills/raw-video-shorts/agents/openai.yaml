@@ -1,4 +1,4 @@
 interface:
   display_name: "Raw Video Shorts"
   short_description: "Turn Raw recordings into reviewed, captioned clips"
-  default_prompt: "$raw-video-shorts I added videos to Raw. Process every worthwhile scene and show me the finished clips."
+  default_prompt: "$raw-video-shorts I added videos to Raw. Clip every moment with short-form potential and show me the finished clips."

@@ -16,6 +16,7 @@ from captions import write_captions
 ROOT = Path(__file__).resolve().parent
 VERSION = 5
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.m4v', '.webm'}
+LONG_CLIP_SECONDS = 90  # editorial guideline for short-form clips; 180 s is the hard limit
 
 
 def run(args):
@@ -107,6 +108,69 @@ def find_source(wanted):
     raise ValueError(f'No video in Raw has source id {wanted}.')
 
 
+@functools.lru_cache(maxsize=1)
+def enable_cuda_libraries():
+    """Put the cuBLAS/cuDNN DLLs from requirements-gpu.txt on PATH (Windows).
+    CTranslate2 loads them by name, so os.add_dll_directory alone is not enough.
+    On Linux, run.sh puts the same libraries on LD_LIBRARY_PATH."""
+    if sys.platform != 'win32':
+        return
+    import importlib.util
+    spec = importlib.util.find_spec('nvidia')
+    folders = [str(f) for base in (spec.submodule_search_locations if spec else []) for f in sorted(Path(base).glob('*/bin'))]
+    if folders:
+        os.environ['PATH'] = os.pathsep.join(folders+[os.environ.get('PATH', '')])
+
+
+@functools.lru_cache(maxsize=None)
+def whisper_device(model_path):
+    """('cuda', 'float16') when a test transcription works on the GPU, else ('cpu', 'int8').
+    The test runs in a child process because a missing CUDA library can abort a process."""
+    if os.environ.get('CLIPSMITH_WHISPER_DEVICE', '').lower() == 'cpu':
+        return 'cpu', 'int8'
+    try:
+        import ctranslate2
+        if not ctranslate2.get_cuda_device_count():
+            return 'cpu', 'int8'
+    except Exception:
+        return 'cpu', 'int8'
+    test = ('import numpy, shorts; shorts.enable_cuda_libraries(); from faster_whisper import WhisperModel; '
+            f'model = WhisperModel({str(model_path)!r}, device="cuda", compute_type="float16"); '
+            'list(model.transcribe(numpy.zeros(32000, numpy.float32), word_timestamps=True)[0])')
+    try:
+        result = subprocess.run([sys.executable, '-c', test], cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=600)
+        failed = result.returncode != 0
+        reason = (result.stderr.strip().splitlines() or ['exit code '+str(result.returncode)])[-1]
+    except subprocess.TimeoutExpired:
+        failed, reason = True, 'the GPU test timed out'
+    if failed:
+        print(f'GPU transcription is unavailable ({reason}); using the CPU.', flush=True)
+        return 'cpu', 'int8'
+    return 'cuda', 'float16'
+
+
+def run_whisper(source, cache, model_path, model_name, task, device, compute_type):
+    from faster_whisper import WhisperModel
+    if device == 'cuda':
+        enable_cuda_libraries()
+    print(f'Transcribing: {source.name} ({model_name}, {device.upper()})', flush=True)
+    model = WhisperModel(str(model_path), device=device, compute_type=compute_type,
+                         cpu_threads=min(8, os.cpu_count() or 4))
+    segments, info = model.transcribe(str(source), task=task, word_timestamps=True, vad_filter=True,
+                                      beam_size=5, condition_on_previous_text=False)
+    data = {'language': 'en' if task=='translate' else info.language, 'source_language': info.language,
+            'model': model_name, 'task': task, 'device': device, 'compute_type': compute_type, 'segments': []}
+    suffix = '-english' if task == 'translate' else ''
+    with (cache / f'transcript-{model_name}{suffix}.txt').open('w', encoding='utf-8') as out:
+        for segment in segments:
+            data['segments'].append(asdict(segment))
+            out.write(f'{segment.start:.2f} - {segment.end:.2f}: {segment.text.strip()}\n')
+            out.flush()
+            print(f'  {segment.end:.0f} seconds processed', flush=True)
+    return data
+
+
 def transcribe(source, cache, model_name, task='transcribe'):
     suffix = '-english' if task == 'translate' else ''
     dest = cache / f'transcript-{model_name}{suffix}.json'
@@ -115,19 +179,17 @@ def transcribe(source, cache, model_name, task='transcribe'):
         cached.setdefault('model',model_name)
         cached.setdefault('task',task)
         return cached
-    from faster_whisper import WhisperModel
-    print(f'Transcribing: {source.name} ({model_name}, CPU)', flush=True)
-    model = WhisperModel(model_name, device='cpu', compute_type='int8', cpu_threads=min(8, os.cpu_count() or 4))
-    segments, info = model.transcribe(str(source), task=task, word_timestamps=True, vad_filter=True,
-                                      beam_size=5, condition_on_previous_text=False)
-    data = {'language': 'en' if task=='translate' else info.language, 'source_language': info.language,
-            'model': model_name, 'task': task, 'segments': []}
-    with (cache / f'transcript-{model_name}{suffix}.txt').open('w', encoding='utf-8') as out:
-        for segment in segments:
-            data['segments'].append(asdict(segment))
-            out.write(f'{segment.start:.2f} - {segment.end:.2f}: {segment.text.strip()}\n')
-            out.flush()
-            print(f'  {segment.end:.0f} seconds processed', flush=True)
+    from faster_whisper.utils import download_model
+    model_path = download_model(model_name)
+    device, compute_type = whisper_device(model_path)
+    try:
+        data = run_whisper(source, cache, model_path, model_name, task, device, compute_type)
+    except RuntimeError as exc:
+        if device == 'cpu':
+            raise
+        # For example the GPU ran out of memory: start again on the CPU.
+        print(f'GPU transcription failed ({exc}); starting again on the CPU.', flush=True)
+        data = run_whisper(source, cache, model_path, model_name, task, 'cpu', 'int8')
     write_json(dest, data)
     return data
 
@@ -406,6 +468,10 @@ def render_plan(source, plan, cache, config, force, model='medium'):
     write_json(output/'plan.json',plan)
     index = []
     transcript = english_transcript(source,cache,model)
+    for clip in plan['clips']:
+        if clip['end']-clip['start'] > LONG_CLIP_SECONDS:
+            print(f'Note: clip {clip["id"]} runs {clip["end"]-clip["start"]:.0f} s. Short-form clips stay within '
+                  f'{LONG_CLIP_SECONDS} s unless the user asks for longer (AGENTS.md, step 2).',flush=True)
     for number,clip in enumerate(plan['clips'],1):
         dest = output/(clip_stem(clip)+'.mp4')
         print(f'Clip {number}/{len(plan["clips"])} [{clip["id"]}]: {clip["title"]} ({clip["end"]-clip["start"]:.1f}s)',flush=True)
@@ -507,10 +573,17 @@ def main():
                 write_json(plan_path,plan)
             if args.require_reviewed and plan.get('selection') not in ('editor-reviewed','agent-reviewed'):
                 raise ValueError('The plan has not been editorially reviewed.')
+            if args.require_reviewed:
+                # Coverage, clip count and word-safe edges; nothing renders until all pass.
+                from selection import check_reviewed_plan
+                check_reviewed_plan(plan,duration,english_transcript(source,cache,args.model))
             if args.analyze_only:
                 print(f'Plan ready: {plan_path}',flush=True)
                 continue
-            render_plan(source,plan,cache,config,args.force,args.model)
+            output = render_plan(source,plan,cache,config,args.force,args.model)
+            if args.require_reviewed:
+                from verify_outputs import verify_folder
+                verify_folder(output,config)
         except Exception as exc:
             print(f'ERROR — {source.name}: {exc}',file=sys.stderr,flush=True)
             failures.append(source)

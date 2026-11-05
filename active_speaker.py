@@ -161,14 +161,16 @@ def fill_gaps(track):
     return positions, boxes
 
 
-def analyze_shot(frames, first_frame, detector, audio_features, sample_width=640):
-    """Track and score only people visible in this exact camera shot."""
+def face_boxes(detector, frame):
+    """YuNet boxes large enough for Light-ASD's mouth crop."""
+    _, detected = detector.detect(frame)
+    return [] if detected is None else [f[:4].astype(float) for f in detected if min(f[2], f[3]) >= 24]
+
+
+def analyze_shot(frames, first_frame, detections, audio_features, sample_width=640):
+    """Track and score only people visible in this exact camera shot.
+    `detections` holds the face boxes of every frame (see `face_boxes`)."""
     import cv2
-    detections = []
-    for frame in frames:
-        _, detected = detector.detect(frame)
-        detections.append([] if detected is None else
-                          [f[:4].astype(float) for f in detected if min(f[2], f[3]) >= 24])
     result = []
     for track in build_tracks(detections):
         positions, boxes = fill_gaps(track)
