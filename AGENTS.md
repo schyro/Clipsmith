@@ -59,8 +59,8 @@ Details: `docs/framing.md`.
 
 The user reviews clips in the clip editor (`run --review-gallery`), which saves `review-decisions.json` in the output profile folder, keyed by clip id.
 
-1. When the user asks to apply their review, and before revising or reselecting a source, run `run --apply-review` (unless they already pressed Apply in the editor). It locks approved clips, moves rejected ones to `rejected/`, writes staged framing, applies moved edges without cutting words, re-renders only what changed and prints the entries still open.
-2. For each open entry (`needs_changes` or `rejected` with `addressed` not true): follow the comment, fix framing through `focus_overrides`, re-cut on word boundaries if the comment asks for more than the moved edges, and re-render.
+1. When the user asks to apply their review, and before revising or reselecting a source, run `run --apply-review` (unless they already pressed Apply in the editor). It locks approved clips, moves rejected ones to `rejected/`, writes staged framing, applies moved edges without cutting words, re-renders only what changed and prints the entries still open, with their notes.
+2. For each open entry (`needs_changes` or `rejected` with `addressed` not true): follow the comment and every timeline note (`notes`: `{"t": <source seconds>, "text": "..."}`, pinned to the moment it is about), fix framing through `focus_overrides`, re-cut on word boundaries if the comment or a note asks for more than the moved edges, and re-render.
 3. Set that entry's `addressed: true`, `addressed_at` and a short `agent_note` in the decisions file.
 4. Leave approved (locked) clips alone unless the user withdraws the approval. Then give the user the review link again.
 

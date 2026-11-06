@@ -1,8 +1,8 @@
 """Review decisions model and the read-only static gallery.
 
 `review-decisions.json` in an output profile folder holds the reviewer's
-decision per clip id: status, change options, comment, moved edges and staged
-framing (`focus_overrides`). The interactive editor (`editor_server.py`,
+decision per clip id: status, change options, comment, notes pinned to source
+times (`notes`), moved edges and staged framing (`focus_overrides`). The interactive editor (`editor_server.py`,
 started by `run --review-gallery`) writes it; `--apply-review` applies it.
 `index.html` is a read-only overview that also works when opened from disk.
 """
@@ -25,6 +25,8 @@ OPTION_LABELS = {'recut': 'Re-cut (start/end)', 'fix_framing': 'Fix framing'}
 MAX_COMMENT = 4000
 MAX_SHIFT = 24*3600.0  # sanity bound only; the editor server keeps edges inside the source
 MAX_OVERRIDES = 200
+MAX_NOTES = 50
+MAX_NOTE = 500
 _LOCK = threading.Lock()  # serializes decisions-file reads and writes across server threads
 
 
@@ -110,6 +112,27 @@ def check_overrides_against_shots(overrides, shots, frame_count):
             raise ValueError(f'Focus override {o["start_frame"]}-{o["end_frame"]} crosses a camera cut.')
 
 
+def validate_notes(notes):
+    """Notes pinned to a moment of the source: a time-sorted list of {"t": source seconds, "text"}.
+    Empty notes are dropped."""
+    if notes is None:
+        return []
+    if not isinstance(notes, list) or len(notes) > MAX_NOTES:
+        raise ValueError(f'notes must be a list of at most {MAX_NOTES} notes.')
+    clean = []
+    for note in notes:
+        if not isinstance(note, dict) or set(note) - {'t', 'text'}:
+            raise ValueError('Each note needs t (source seconds) and text.')
+        t, text = note.get('t'), note.get('text', '')
+        if not _number(t) or t < 0 or t > MAX_SHIFT:
+            raise ValueError('A note time must be a number of seconds.')
+        if not isinstance(text, str) or len(text) > MAX_NOTE:
+            raise ValueError(f'A note must be text of at most {MAX_NOTE} characters.')
+        if text.strip():
+            clean.append({'t': round(float(t), 3), 'text': ' '.join(text.split())})
+    return sorted(clean, key=lambda n: n['t'])
+
+
 def validate_update(update):
     """Return a clean decision dict or raise ValueError."""
     if not isinstance(update, dict):
@@ -130,7 +153,13 @@ def validate_update(update):
             raise ValueError(f'{name} must be a number of seconds.')
         shifts[name] = round(float(value), 3)
     return {'status': status, 'options': [o for o in OPTIONS if o in options], 'comment': comment.strip(), **shifts,
-            'focus_overrides': validate_overrides(update.get('focus_overrides'))}
+            'focus_overrides': validate_overrides(update.get('focus_overrides')),
+            'notes': validate_notes(update.get('notes'))}
+
+
+def _stored(entry, key):
+    """An entry field as validate_update would return it when absent."""
+    return entry.get(key, 0 if key.endswith('_shift') else [] if key == 'notes' else None)
 
 
 def apply_decision(decisions, clip, update, timestamp=None):
@@ -138,7 +167,7 @@ def apply_decision(decisions, clip, update, timestamp=None):
     clean = validate_update(update)
     key = clip_key(clip)
     entry = dict(decisions['clips'].get(key, {}))
-    if not entry or any(entry.get(k, 0 if k.endswith('_shift') else None) != clean[k] for k in clean):
+    if not entry or any(_stored(entry, k) != clean[k] for k in clean):
         entry.update(clean)
         entry.update({'file': clip.get('file', ''), 'title': clip.get('title', ''), 'start': clip.get('start'),
                       'end': clip.get('end'), 'updated': timestamp or now_iso(), 'addressed': False})
@@ -146,8 +175,15 @@ def apply_decision(decisions, clip, update, timestamp=None):
         entry.pop('agent_note', None)
     if entry.get('focus_overrides') is None:
         entry.pop('focus_overrides', None)
+    if not entry.get('notes'):
+        entry.pop('notes', None)
     decisions['clips'][key] = entry
     return entry
+
+
+def note_time(seconds):
+    m, s = divmod(max(0.0, seconds), 60)
+    return f'{int(m)}:{s:05.2f}'
 
 
 def actionable(decisions):
@@ -186,6 +222,7 @@ video{width:100%;aspect-ratio:4/5;background:#000;display:block}.body{padding:12
 h2{font-size:16px;margin:0}.num{color:var(--muted);font-weight:400;margin-right:6px}.reason,.comment{color:var(--muted);font-size:13px;margin:0}
 .facts{color:var(--muted);display:flex;gap:10px;flex-wrap:wrap;font-size:12px}.facts a{color:var(--accent);text-decoration:none}
 .status{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.notes{margin:0;padding-left:18px;color:var(--muted);font-size:13px}.notes span{font-variant-numeric:tabular-nums;color:var(--text)}
 """
 
 
@@ -205,6 +242,9 @@ def render_page(clips, plan=None, profile='', decisions=None, focus_dir_href=Non
             links.insert(0, f'<a href="{focus_dir_href}/{quote(stem)}.jpg" target="_blank">Framing sheet</a>')
         locked = ' · locked (approved)' if clip.get('approved') else ''
         comment = f'<p class="comment">“{html.escape(entry["comment"])}”</p>' if entry.get('comment') else ''
+        if entry.get('notes'):
+            comment += '<ul class="notes">'+''.join(
+                f'<li><span>{note_time(n["t"]-clip["start"])}</span> {html.escape(n["text"])}</li>' for n in entry['notes'])+'</ul>'
         cards.append(
             f'<article data-clip="{html.escape(key)}" data-status="{html.escape(status)}">'
             f'<video controls preload="metadata" poster="{quote(stem)}.jpg" src="{quote(file)}"></video>'

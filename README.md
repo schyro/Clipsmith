@@ -51,12 +51,13 @@ A plain `./run.cmd` with no options picks clips with a simple keyword heuristic.
 
 `./run.cmd --review-gallery` opens the editor in its own window (`http://127.0.0.1:8765/editor/`). For each clip you can:
 
-- approve it, reject it or ask for changes, with a comment
+- approve it, reject it or ask for changes, with a comment or notes pinned to moments on the timeline
 - move the start and end (cuts snap to word boundaries)
 - set the framing per camera shot
-- fix, retime, add or re-transcribe caption words, and choose where a caption line breaks
+- fix, retime, add or re-transcribe caption words, choose where a caption line breaks, and find and replace words across the whole source
+- step through flagged shots and low-confidence words, zoom the timeline with Ctrl + mouse wheel, and undo any edit
 
-Press **Apply** to re-render the changed clips, or ask the agent to apply your review. The agent handles your comments. **Export approved** copies the approved clips to a `ready/` folder.
+Press **Apply** to re-render the changed clips, or ask the agent to apply your review. The agent handles your comments and notes. **Export approved** copies the approved clips to a `ready/` folder.
 
 Full guide: [docs/clip-editor.md](docs/clip-editor.md).
 
@@ -82,4 +83,5 @@ Clipsmith is released under the [MIT License](LICENSE). It bundles or uses:
 - [Light-ASD](https://github.com/Junhua-Liao/Light-ASD) (MIT), in `third_party/light_asd`; see `PROVENANCE.md` there
 - [OpenCV YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) face detector; licence in `assets/licenses/LICENSE-YuNet.txt`
 - [Dosis](https://github.com/google/fonts/tree/main/ofl/dosis) font (SIL OFL); licence in `assets/licenses/OFL-Dosis.txt`
+- [IBM Plex Sans and IBM Plex Mono](https://github.com/google/fonts/tree/main/ofl/ibmplexsans) fonts for the clip editor (SIL OFL); licence in `assets/licenses/OFL-IBM-Plex.txt`
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [FFmpeg](https://ffmpeg.org/), and [Preact](https://preactjs.com/) with [htm](https://github.com/developit/htm) (vendored in `editor/vendor/`)

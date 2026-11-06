@@ -69,8 +69,8 @@ def original_words(source, cache, model):
 
 def indexed_words(source, cache, model):
     """Every caption word in time order: its index or id, kind (transcript, missed
-    speech or added), edited text and timing, the original text and timing, and
-    its line break override."""
+    speech or added), edited text and timing, the original text and timing, its
+    line break override and the recogniser's confidence (None for added words)."""
     from shorts import english_transcript
     originals = original_words(source, cache, model)
     result = []
@@ -82,9 +82,32 @@ def indexed_words(source, cache, model):
             result.append({'index': index, 'kind': kind, 'start': round(w['start'], 3), 'end': round(w['end'], 3),
                            'word': w['word'].strip(), 'original': o['word'].strip() if o else '',
                            'original_start': round(o['start'], 3) if o else None,
-                           'original_end': round(o['end'], 3) if o else None, 'line': w.get('line')})
+                           'original_end': round(o['end'], 3) if o else None, 'line': w.get('line'),
+                           'probability': round(o['probability'], 3) if o and 'probability' in o else None})
     result.sort(key=lambda w: (w['start'], w['end']))
     return result
+
+
+def _find_key(text):
+    return text.strip().lower().strip('"“”()[]').rstrip('.,!?;:…')
+
+
+def find_words(words, query, limit=500):
+    """Runs of consecutive caption words that read `query` (case and edge punctuation
+    ignored), e.g. "ma 'am" finds the two words "ma" and "'am."."""
+    terms = [_find_key(t) for t in str(query).split()]
+    terms = [t for t in terms if t]
+    if not terms:
+        return []
+    shown = [w for w in words if w['word'].strip()]
+    matches = []
+    for i in range(len(shown)-len(terms)+1):
+        run = shown[i:i+len(terms)]
+        if all(_find_key(w['word']) == t for w, t in zip(run, terms)):
+            matches.append({'start': run[0]['start'], 'end': run[-1]['end'], 'words': [dict(w) for w in run]})
+            if len(matches) >= limit:
+                break
+    return matches
 
 
 def edits_path(cache: Path, model):
@@ -109,15 +132,33 @@ def load_edits(cache: Path, model):
 
 def save_caption_edit(source, cache, model, index, changes):
     """Apply editor changes (`to`, `start`, `end`, `line`; None restores) to one word."""
-    from shorts import write_json
-    from transcript_edits import update_added, update_edit
     if not isinstance(changes, dict) or not changes:
         raise ValueError('Nothing to change.')
+    return save_caption_edits(source, cache, model, [{'index': index, **changes}])
+
+
+def save_caption_edits(source, cache, model, items):
+    """Apply several word changes at once (a replace-all, an undo): each item is
+    {"index": ..., and any of `to`, `start`, `end`, `line`}. All or nothing."""
+    from shorts import write_json
+    from transcript_edits import FIELDS, update_added, update_edit
+    if not isinstance(items, list) or not 0 < len(items) <= 1000:
+        raise ValueError('Nothing to change.')
     edits = load_edits(cache, model)
-    if isinstance(index, str) and index.startswith('u'):
-        update_added(edits, index, changes)
-    else:
-        original = original_words(source, cache, model).get(index) if type(index) in (int, str) else None
+    originals = None
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError('Each change needs an index.')
+        index = item.get('index')
+        changes = {k: item[k] for k in FIELDS if k in item}
+        if set(item)-{'index', *FIELDS} or not changes:
+            raise ValueError('Each change needs an index and at least one of to, start, end and line.')
+        if isinstance(index, str) and index.startswith('u'):
+            update_added(edits, index, changes)
+            continue
+        if originals is None:
+            originals = original_words(source, cache, model)
+        original = originals.get(index) if type(index) in (int, str) else None
         if original is None:
             raise ValueError('Unknown word index.')
         update_edit(edits, index, original, changes)

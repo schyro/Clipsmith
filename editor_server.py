@@ -295,6 +295,11 @@ def make_handler(state: State, job: Job):
                 if not path.exists():
                     return self._error(404, 'Nothing has been re-transcribed yet.')
                 return self._send(200, json.loads(path.read_text(encoding='utf-8')))
+            if name == 'find':
+                text = query.get('q', [''])[0]
+                if len(text) > 200:
+                    return self._error(400, 'The search text is too long.')
+                return self._send(200, {'query': text, 'matches': editor_ops.find_words(state.words(), text)})
             segments = name.split('/')
             if len(segments) == 3 and segments[0] == 'clips':
                 clip = state.clip(unquote(segments[1]))
@@ -421,6 +426,11 @@ def make_handler(state: State, job: Job):
                 changes = {k: body[k] for k in FIELDS if k in body}
                 with _LOCK:
                     editor_ops.save_caption_edit(state.source, state.cache, MODEL, body.get('index'), changes)
+                state.forget_transcript()
+                return self._send(200, {'ok': True})
+            if name == 'captions/batch':
+                with _LOCK:
+                    editor_ops.save_caption_edits(state.source, state.cache, MODEL, body.get('changes'))
                 state.forget_transcript()
                 return self._send(200, {'ok': True})
             if name == 'captions/add':

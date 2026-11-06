@@ -71,6 +71,30 @@ class CaptionEditTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 editor_ops.set_caption_edit(edits, 2, 'w', bad)
 
+    def test_find_matches_word_runs_ignoring_case_and_edge_punctuation(self):
+        words = [{'index': i, 'kind': 'transcript', 'word': w, 'start': i, 'end': i+.5}
+                 for i, w in enumerate(['No,', 'ma', "'am.", 'Yes,', 'Ma', "'am.", '', 'Tag?'])]
+        found = editor_ops.find_words(words, "ma 'am")
+        self.assertEqual([[1, 2], [4, 5]], [[w['index'] for w in m['words']] for m in found])
+        self.assertEqual((1, 2.5), (found[0]['start'], found[0]['end']))
+        self.assertEqual([7], [m['words'][0]['index'] for m in editor_ops.find_words(words, 'tag')])
+        self.assertEqual([], editor_ops.find_words(words, '  '))
+
+    def test_batch_edits_apply_together_or_not_at_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ids = editor_ops.add_caption_words(tmp, 'medium', [{'word': 'Hey', 'start': 1.0, 'end': 1.3},
+                                                               {'word': 'you', 'start': 1.3, 'end': 1.6}])
+            editor_ops.save_caption_edits(None, tmp, 'medium', [{'index': ids[0], 'to': 'Hey,', 'end': 1.25},
+                                                                {'index': ids[1], 'line': 'break'}])
+            added = editor_ops.load_edits(tmp, 'medium')['added']
+            self.assertEqual([('Hey,', 1.25, None), ('you', 1.6, 'break')], [(a['word'], a['end'], a.get('line')) for a in added])
+            with self.assertRaises(ValueError):
+                editor_ops.save_caption_edits(None, tmp, 'medium', [{'index': ids[0], 'to': 'Hi'}, {'index': 'u99', 'to': 'x'}])
+            self.assertEqual('Hey,', editor_ops.load_edits(tmp, 'medium')['added'][0]['word'])
+            for bad in [[], [{'index': ids[0]}], [{'index': ids[0], 'to': 'a', 'speaker': 'b'}], 'x']:
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    editor_ops.save_caption_edits(None, tmp, 'medium', bad)
+
     def test_caption_events_follow_the_renderer_schedule(self):
         transcript = {'segments': [{'start': 10, 'end': 22, 'words': [dict(w, word=' w') for w in WORDS]}]}
         groups = editor_ops.caption_events(transcript, 10.0, 22.0, CONFIG)

@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from gallery import load_decisions, save_decisions
-from review_apply import apply_to_plan, shift_clip_timing, snap_edges
+from review_apply import apply_to_plan, closes, shift_clip_timing, snap_edges
 import shorts
 
 WORDS = [{'start': s, 'end': s+.4, 'word': 'w'} for s in [10.0, 10.5, 11.0, 13.0, 13.5, 20.0, 20.6, 21.2]]
@@ -89,6 +89,19 @@ class ApplyTests(unittest.TestCase):
         self.assertNotIn('approved', plan['clips'][1])  # approval withdrawn
         self.assertEqual({'01', '02'}, done)
         self.assertIn('03', notes)
+
+    def test_comments_and_notes_keep_an_applied_entry_open(self):
+        recut = {'status': 'needs_changes', 'options': ['recut']}
+        self.assertTrue(closes(recut, {'recut'}))
+        self.assertFalse(closes({**recut, 'comment': 'Tighter'}, {'recut'}))
+        self.assertFalse(closes({**recut, 'notes': [{'t': 12, 'text': 'Start here'}]}, {'recut'}))
+        self.assertFalse(closes({'status': 'needs_changes', 'options': ['recut', 'fix_framing']}, {'recut'}))
+        self.assertFalse(closes({'status': 'needs_changes', 'options': []}, set()))
+        self.assertTrue(closes({'status': 'rejected', 'notes': [{'t': 1, 'text': 'x'}]}, set()))
+        plan = self.plan()
+        apply_to_plan(plan, {'clips': {'02': {'status': 'rejected', 'notes': [{'t': 31, 'text': 'Weak start'}]}}},
+                      WORDS, 100, 'now')
+        self.assertEqual([{'t': 31, 'text': 'Weak start'}], plan['rejected_clips'][0]['review_notes'])
 
     def test_approval_locks_and_addressed_entries_are_not_reapplied(self):
         plan = self.plan()

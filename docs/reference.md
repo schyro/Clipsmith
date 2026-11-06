@@ -52,7 +52,7 @@ Whisper medium runs locally and caches word timestamps per source. With an NVIDI
 {"model":"medium","edits":[{"index":123,"from":"Jon.","to":"John."},{"index":"g7","from":"God.","to":"God!"}]}
 ```
 
-`from` must match the recognised word. The clip editor writes the same file and may also set `start`/`end` (new word timing in source seconds) and `line` (`"break"` starts a new caption line at the word, `"join"` keeps it on the previous line; a line never grows past 34 characters) on an edit, and keeps words typed or accepted in the editor under `"added": [{"id": "u1", "start": 335.96, "end": 336.4, "word": "God."}]`. Each MP4 has an English SRT sidecar; the animated, highlighted appearance is burned into the MP4.
+`from` must match the recognised word. The clip editor writes the same file and may also set `start`/`end` (new word timing in source seconds) and `line` (`"break"` starts a new caption line at the word, `"join"` keeps it on the previous line; a line never grows past 34 characters) on an edit, and keeps words typed or accepted in the editor under `"added": [{"id": "u1", "start": 335.96, "end": 336.4, "word": "God."}]`. The editor's *Replace all* writes ordinary edits: a match of several words keeps its first word, with the new text and the last word's end, and removes the others. Each MP4 has an English SRT sidecar; the animated, highlighted appearance is burned into the MP4.
 
 ## Frame grid and camera cuts
 

@@ -7,7 +7,8 @@ Mechanical decisions are applied directly:
   replace the clip's overrides (before any re-cut, since they use its frames);
 - needs changes with moved edges: the new start/end are kept off spoken words.
 An entry is closed (`addressed`) when every requested option was handled and it
-has no comment. Comments and unhandled requests stay open for the editorial agent.
+has no comment or notes. Comments, notes and unhandled requests stay open for the
+editorial agent.
 """
 from __future__ import annotations
 import json
@@ -140,8 +141,10 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, gri
         elif clip.pop('approved', None):
             notes[key] = 'Approval withdrawn; the clip renders normally again.'
         if status == 'rejected' and not entry.get('addressed'):
-            plan.setdefault('rejected_clips', []).append(
-                {**clip, 'rejected_at': timestamp, 'review_comment': entry.get('comment', '')})
+            rejected = {**clip, 'rejected_at': timestamp, 'review_comment': entry.get('comment', '')}
+            if entry.get('notes'):
+                rejected['review_notes'] = [dict(n) for n in entry['notes']]
+            plan.setdefault('rejected_clips', []).append(rejected)
             notes[key] = 'Removed from the plan; files moved to rejected/.'
             done.add(key)
             continue
@@ -169,8 +172,17 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, gri
     return notes, done
 
 
+def closes(entry, done_options):
+    """An applied entry is addressed when it was rejected, or when every requested
+    option was handled and no comment or note still needs the agent."""
+    if entry.get('status') == 'rejected':
+        return True
+    return bool(done_options) and set(entry.get('options') or []) <= set(done_options) \
+        and not entry.get('comment') and not entry.get('notes')
+
+
 def apply_review(output: Path, root: Path, config, force=False, model='medium'):
-    from gallery import DECISIONS_FILE, actionable, load_decisions, now_iso, save_decisions, write_gallery
+    from gallery import DECISIONS_FILE, actionable, load_decisions, note_time, now_iso, save_decisions, write_gallery
     from shorts import (clip_files, clip_stem, english_transcript, find_source, load_plan, probe,
                         render_plan, validate_plan, write_json)
     output = Path(output)
@@ -215,10 +227,7 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
             if key in current:
                 entry.update({'start': current[key]['start'], 'end': current[key]['end'],
                               'file': clip_stem(current[key])+'.mp4'})
-            # Closed when every requested option was handled and no comment needs the agent.
-            done_options = handled.get(key, set())
-            if entry['status'] == 'rejected' or (done_options and set(entry.get('options') or []) <= done_options
-                                                 and not entry.get('comment')):
+            if closes(entry, handled.get(key, set())):
                 entry.update({'addressed': True, 'addressed_at': timestamp})
     decisions['profile'] = target.name
     save_decisions(target, decisions)
@@ -234,6 +243,9 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
         for key, entry in sorted(remaining.items()):
             what = ', '.join(entry.get('options') or []) or entry['status']
             print(f'  [{key}] {entry.get("title", "")}: {what}; comment: {entry.get("comment") or "-"}', flush=True)
+            start = entry.get('start') or 0
+            for note in entry.get('notes') or []:
+                print(f'      note at {note_time(note["t"]-start)} (source {note["t"]:.2f} s): {note["text"]}', flush=True)
     return target, remaining
 
 

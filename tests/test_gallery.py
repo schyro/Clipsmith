@@ -22,7 +22,7 @@ class DecisionTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_update(bad)
         self.assertEqual({'status': 'needs_changes', 'options': ['recut', 'fix_framing'], 'comment': 'x',
-                          'start_shift': 0.0, 'end_shift': 0.0, 'focus_overrides': None},
+                          'start_shift': 0.0, 'end_shift': 0.0, 'focus_overrides': None, 'notes': []},
                          validate_update({'status': 'needs_changes', 'options': ['fix_framing', 'recut'], 'comment': ' x '}))
         # Edges are not limited to a fixed distance; the editor server keeps them inside the source.
         self.assertEqual(95.5, validate_update({'start_shift': 95.5})['start_shift'])
@@ -56,6 +56,33 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(changed['addressed'])
         self.assertNotIn('agent_note', changed)
         self.assertEqual({'title': 'A', 'start': 10.0, 'end': 40.0}, {k: changed[k] for k in ('title', 'start', 'end')})
+
+    def test_notes_are_sorted_trimmed_and_empty_ones_dropped(self):
+        for bad in [{'notes': {}}, {'notes': [{'t': -1, 'text': 'x'}]}, {'notes': [{'t': '3', 'text': 'x'}]},
+                    {'notes': [{'t': 3, 'text': 'x'*501}]}, {'notes': [{'t': 3, 'text': 'x', 'by': 'me'}]},
+                    {'notes': [{'t': 1, 'text': 'x'}]*51}]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_update(bad)
+        notes = validate_update({'notes': [{'t': 20.1234, 'text': ' Keep  the pause '}, {'t': 12, 'text': 'Start here'},
+                                           {'t': 15, 'text': '  '}]})['notes']
+        self.assertEqual([{'t': 12.0, 'text': 'Start here'}, {'t': 20.123, 'text': 'Keep the pause'}], notes)
+
+    def test_notes_are_stored_reopen_the_entry_and_show_in_the_gallery(self):
+        decisions = empty_decisions({'source_id': 's'}, 'p')
+        entry = apply_decision(decisions, CLIP, {'status': 'needs_changes', 'notes': [{'t': 12.5, 'text': 'Cut here'}]}, 't1')
+        self.assertEqual([{'t': 12.5, 'text': 'Cut here'}], entry['notes'])
+        entry.update({'addressed': True})
+        same = apply_decision(decisions, CLIP, {'status': 'needs_changes', 'notes': [{'t': 12.5, 'text': 'Cut here'}]}, 't2')
+        self.assertTrue(same['addressed'])
+        cleared = apply_decision(decisions, CLIP, {'status': 'needs_changes'}, 't3')
+        self.assertNotIn('notes', cleared)
+        self.assertFalse(cleared['addressed'])
+        plain = apply_decision(empty_decisions({}, 'p'), CLIP, {'status': 'pending'})
+        self.assertNotIn('notes', plain)
+        decisions['clips']['01']['notes'] = [{'t': 12.5, 'text': '<b>Cut</b> here'}]
+        page = render_page([CLIP], {'source': 'a.mp4'}, 'p', decisions)
+        self.assertIn('0:02.50', page)
+        self.assertIn('&lt;b&gt;Cut&lt;/b&gt; here', page)
 
     def test_actionable_lists_only_open_change_requests(self):
         clips = {'a': {'status': 'approved'}, 'b': {'status': 'needs_changes'}, 'c': {'status': 'rejected', 'addressed': True},
