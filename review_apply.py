@@ -86,13 +86,23 @@ def snap_edges(words, start, end, start_shift, end_shift, duration):
     return new_start, new_end
 
 
-def shift_clip_timing(clip, new_start, new_end):
-    """Move start/end and keep reviewed overrides and the cover on the same source moment."""
-    frames = round((new_start-clip['start'])*FPS)
+def shift_clip_timing(clip, new_start, new_end, grid=None):
+    """Move start/end and keep reviewed overrides and the cover on the same source moment.
+    With the source's frame grid (frame_grid.FrameGrid) each override edge keeps showing
+    the same source frame; a new start can change which frames repeat in the 30 fps grid,
+    so a plain frame offset could move an override edge across a camera cut."""
+    if grid is not None:
+        old_origin, new_origin = grid.origin(clip['start']), grid.origin(new_start)
+        def moved_frame(n):
+            return grid.remap(n, old_origin, new_origin)
+    else:
+        frames = round((new_start-clip['start'])*FPS)
+        def moved_frame(n):
+            return n-frames
     length = int((new_end-new_start)*FPS+.999)
     overrides = []
     for o in clip.get('focus_overrides', []):
-        a, b = o['start_frame']-frames, o['end_frame']-frames
+        a, b = moved_frame(o['start_frame']), moved_frame(o['end_frame'])
         lo, hi = max(0, a), min(length, b)
         if hi <= lo:
             continue
@@ -110,9 +120,10 @@ def shift_clip_timing(clip, new_start, new_end):
     return updated
 
 
-def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None):
+def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, grid=None):
     """Change the plan in place. Returns (notes per clip id, ids applied mechanically).
-    `handled`, when given, is filled with the set of options handled per clip id."""
+    `handled`, when given, is filled with the set of options handled per clip id;
+    `grid` (frame_grid.FrameGrid) keeps re-cut overrides on their source frames."""
     from gallery import clip_key
     notes, done = {}, set()
     handled = {} if handled is None else handled
@@ -148,7 +159,7 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None):
             start, end = snap_edges(words, clip['start'], clip['end'], entry.get('start_shift', 0),
                                     entry.get('end_shift', 0), duration)
             said.append(f'Re-cut {clip["start"]:.2f}-{clip["end"]:.2f} s to {start:.2f}-{end:.2f} s without cutting words.')
-            clip = shift_clip_timing(clip, start, end)
+            clip = shift_clip_timing(clip, start, end, grid)
             handled.setdefault(key, set()).add('recut')
             done.add(key)
         if said:
@@ -174,10 +185,12 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
     cache = Path(root)/'work'/source_id
     transcript = english_transcript(source, cache, model)
     words = [w for s in transcript['segments'] for w in s.get('words', [])]
+    from frame_grid import load_grid
+    grid = load_grid(source, cache)
     timestamp = now_iso()
     before = {c['id']: c for c in plan['clips']}
     handled = {}
-    notes, done = apply_to_plan(plan, decisions, words, duration, timestamp, handled)
+    notes, done = apply_to_plan(plan, decisions, words, duration, timestamp, handled, grid)
     validate_plan(plan, source_id, duration)
     write_json(plan_path, plan)
     # Archive rejected clips explicitly, before render_plan tidies the folder.
@@ -190,7 +203,7 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
     if config['profile'] != output.name:
         print(f'Note: rendering into the current profile {config["profile"]}, not {output.name}.', flush=True)
     pending = snapshot_history(output)
-    target = render_plan(source, plan, cache, config, force, model)
+    target = render_plan(source, plan, cache, config, force, model, plan_path)
     finalize_history(output if target == output else None, pending)
     current = {c['id']: c for c in plan['clips']}
     for key, note in notes.items():

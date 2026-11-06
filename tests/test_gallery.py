@@ -11,7 +11,7 @@ CLIP = {'id': '01', 'file': '01_A.mp4', 'title': 'A', 'start': 10.0, 'end': 40.0
 class DecisionTests(unittest.TestCase):
     def test_validation_rejects_unknown_status_and_options(self):
         for bad in [{'status': 'maybe'}, {'options': ['fix_captions']}, {'options': 'recut'}, {'comment': 5}, [],
-                    {'start_shift': 40}, {'end_shift': '1'}, {'start_shift': True}, {'focus_overrides': {}},
+                    {'start_shift': float('inf')}, {'end_shift': '1'}, {'start_shift': True}, {'focus_overrides': {}},
                     {'focus_overrides': [{'start_frame': 5, 'end_frame': 5, 'center_x': .5}]},
                     {'focus_overrides': [{'start_frame': 0, 'end_frame': 9, 'center_x': 1.5}]},
                     {'focus_overrides': [{'start_frame': 0, 'end_frame': 9}]},
@@ -24,6 +24,8 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual({'status': 'needs_changes', 'options': ['recut', 'fix_framing'], 'comment': 'x',
                           'start_shift': 0.0, 'end_shift': 0.0, 'focus_overrides': None},
                          validate_update({'status': 'needs_changes', 'options': ['fix_framing', 'recut'], 'comment': ' x '}))
+        # Edges are not limited to a fixed distance; the editor server keeps them inside the source.
+        self.assertEqual(95.5, validate_update({'start_shift': 95.5})['start_shift'])
 
     def test_staged_overrides_are_sorted_and_checked_against_cuts(self):
         clean = validate_update({'status': 'needs_changes', 'focus_overrides': [

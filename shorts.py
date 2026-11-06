@@ -134,6 +134,15 @@ def whisper_device(model_path):
             return 'cpu', 'int8'
     except Exception:
         return 'cpu', 'int8'
+    # A passed test is remembered, so short editor transcriptions skip it. A later GPU
+    # failure still falls back to the CPU where the model runs.
+    memo = ROOT/'work'/'whisper-device.json'
+    key = f'{model_path}|{ctranslate2.__version__}'
+    try:
+        if json.loads(memo.read_text(encoding='utf-8')).get(key) == 'cuda':
+            return 'cuda', 'float16'
+    except (OSError, ValueError):
+        pass
     test = ('import numpy, shorts; shorts.enable_cuda_libraries(); from faster_whisper import WhisperModel; '
             f'model = WhisperModel({str(model_path)!r}, device="cuda", compute_type="float16"); '
             'list(model.transcribe(numpy.zeros(32000, numpy.float32), word_timestamps=True)[0])')
@@ -147,6 +156,12 @@ def whisper_device(model_path):
     if failed:
         print(f'GPU transcription is unavailable ({reason}); using the CPU.', flush=True)
         return 'cpu', 'int8'
+    try:
+        known = json.loads(memo.read_text(encoding='utf-8')) if memo.exists() else {}
+        memo.parent.mkdir(exist_ok=True)
+        write_json(memo, {**known, key: 'cuda'})
+    except (OSError, ValueError):
+        pass
     return 'cuda', 'float16'
 
 
@@ -194,23 +209,21 @@ def transcribe(source, cache, model_name, task='transcribe'):
     return data
 
 
-def english_transcript(source, cache, model_name):
+def english_transcript(source, cache, model_name, find_missed=True):
+    """The English transcript with the missed-speech words (missed_speech.py) and the
+    caption corrections (transcript_edits.py) merged in. Every word has an `index`.
+    `find_missed=False` only uses an existing missed-speech pass instead of running it."""
+    from missed_speech import load_gaps, missed_speech
+    from transcript_edits import merged_transcript
     original = transcribe(source,cache,model_name)
-    result = original if original['language']=='en' else transcribe(source,cache,model_name,'translate')
+    task = 'transcribe' if original['language']=='en' else 'translate'
+    result = original if task=='transcribe' else transcribe(source,cache,model_name,'translate')
+    language = original.get('source_language') or original['language']
+    gaps = (missed_speech(source,cache,model_name,result,task,language) if find_missed
+            else load_gaps(cache,model_name,task))
     edits_path = cache/f'caption-edits-{model_name}.json'
-    if edits_path.exists():
-        import copy
-        result = copy.deepcopy(result)
-        edits = json.loads(edits_path.read_text(encoding='utf-8-sig'))
-        if edits.get('model') != model_name:
-            raise ValueError('Caption corrections belong to a different model.')
-        words = [w for s in result['segments'] for w in s.get('words',[])]
-        for edit in edits['edits']:
-            word = words[edit['index']]
-            if word['word'].strip() != edit['from']:
-                raise ValueError(f'Caption correction source word mismatch: {edit}')
-            word['word'] = ' '+edit['to']
-    return result
+    edits = json.loads(edits_path.read_text(encoding='utf-8-sig')) if edits_path.exists() else None
+    return merged_transcript(result,gaps,edits,model_name)
 
 
 def settings():
@@ -461,13 +474,36 @@ def output_folder(plan, config):
     return ROOT/'Output'/(Path(plan['source']).stem+'_'+plan['source_id'][:6])/config['profile']
 
 
-def render_plan(source, plan, cache, config, force, model='medium'):
+def snap_plan_to_cuts(source, plan, cache, config, transcript, output, force, plan_path=None):
+    """Move clip edges off a few frames of a neighbouring camera shot (shot_edges.py).
+    Locked clips keep their edges. A changed plan is written back to `plan_path`."""
+    from frame_grid import load_grid
+    from shot_edges import snap_clip_to_cuts
+    grid = load_grid(source, cache)
+    words = [w for s in transcript['segments'] for w in s.get('words',[])]
+    changed = False
+    for number,clip in enumerate(plan['clips']):
+        if is_locked(clip, output/(clip_stem(clip)+'.mp4'), force):
+            continue
+        moved, notes = snap_clip_to_cuts(source,clip,cache,config,words,grid)
+        for note in notes:
+            print(f'Clip {clip["id"]}: {note}',flush=True)
+        if moved is not clip:
+            plan['clips'][number] = moved
+            changed = True
+    if changed and plan_path:
+        write_json(Path(plan_path),plan)
+    return changed
+
+
+def render_plan(source, plan, cache, config, force, model='medium', plan_path=None):
     """Render every clip of a validated plan; return the output folder."""
     output = output_folder(plan, config)
     output.mkdir(parents=True,exist_ok=True)
-    write_json(output/'plan.json',plan)
     index = []
     transcript = english_transcript(source,cache,model)
+    snap_plan_to_cuts(source,plan,cache,config,transcript,output,force,plan_path)
+    write_json(output/'plan.json',plan)
     for clip in plan['clips']:
         if clip['end']-clip['start'] > LONG_CLIP_SECONDS:
             print(f'Note: clip {clip["id"]} runs {clip["end"]-clip["start"]:.0f} s. Short-form clips stay within '
@@ -580,7 +616,7 @@ def main():
             if args.analyze_only:
                 print(f'Plan ready: {plan_path}',flush=True)
                 continue
-            output = render_plan(source,plan,cache,config,args.force,args.model)
+            output = render_plan(source,plan,cache,config,args.force,args.model,plan_path)
             if args.require_reviewed:
                 from verify_outputs import verify_folder
                 verify_folder(output,config)

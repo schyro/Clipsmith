@@ -8,7 +8,7 @@ You drop a video into `Raw/` and tell your AI coding agent (Codex, Claude Code, 
 
 - **4:5 vertical clips** (1080×1350 by default) that follow whoever is speaking. Faces are tracked, and audiovisual speaker detection (Light-ASD) decides who is talking.
 - **Word-by-word highlighted captions**, transcribed locally with Whisper.
-- **Clean cuts** that never split a word, with loudness normalisation and soft audio fades.
+- **Clean cuts** that never split a word or flash a few frames of the neighbouring camera shot, with loudness normalisation and soft audio fades.
 - **A clip editor in your browser** to approve or reject clips, move edges, fix framing and correct caption words.
 
 ## Requirements
@@ -49,12 +49,12 @@ A plain `./run.cmd` with no options picks clips with a simple keyword heuristic.
 
 ![The Clipsmith clip editor](docs/images/clip-editor.png)
 
-`./run.cmd --review-gallery` opens the editor at `http://127.0.0.1:8765/editor/`. For each clip you can:
+`./run.cmd --review-gallery` opens the editor in its own window (`http://127.0.0.1:8765/editor/`). For each clip you can:
 
 - approve it, reject it or ask for changes, with a comment
 - move the start and end (cuts snap to word boundaries)
 - set the framing per camera shot
-- fix caption words
+- fix, retime, add or re-transcribe caption words, and choose where a caption line breaks
 
 Press **Apply** to re-render the changed clips, or ask the agent to apply your review. The agent handles your comments. **Export approved** copies the approved clips to a `ready/` folder.
 

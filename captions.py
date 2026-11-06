@@ -15,7 +15,10 @@ def clip_words(transcript, clip):
             if not text:
                 continue
             if end > start:
-                words.append({'start':start,'end':end,'word':' '.join(pending+[text])})
+                item = {'start':start,'end':end,'word':' '.join(pending+[text])}
+                if word.get('line'):
+                    item['line'] = word['line']
+                words.append(item)
                 pending = []
             elif clip['start'] <= word['start'] < clip['end'] and word['end']==word['start']:
                 # Whisper sometimes assigns a zero-width timestamp to a short
@@ -35,16 +38,26 @@ def clip_words(transcript, clip):
     return ordered
 
 
+MAX_CAPTION_CHARS = 34  # one line at the caption font size
+
+
 def caption_groups(words, max_words=5):
+    """Split words into one-line caption groups. A word's reviewed `line` overrides
+    the automatic split: "break" starts a new line at it, "join" keeps it on the
+    previous line (the line still cannot grow past MAX_CAPTION_CHARS)."""
     result, group = [], []
-    for word in words:
-        if group and (len(group) >= max_words or word['end']-group[0]['start'] > 2.4
-                      or word['start']-group[-1]['end'] > .45
-                      or len(' '.join(w['word'] for w in group+[word])) > 34):
-            result.append(group)
-            group = []
+    for i, word in enumerate(words):
+        line = word.get('line')
+        if group:
+            too_long = len(' '.join(w['word'] for w in group+[word])) > MAX_CAPTION_CHARS
+            automatic = (len(group) >= max_words or word['end']-group[0]['start'] > 2.4
+                         or word['start']-group[-1]['end'] > .45)
+            if line == 'break' or too_long or (automatic and line != 'join'):
+                result.append(group)
+                group = []
         group.append(word)
-        if re.search(r'[.!?]["\u201d\u2019]*$', word['word']):
+        following = words[i+1] if i+1 < len(words) else None
+        if re.search(r'[.!?]["\u201d\u2019]*$', word['word']) and not (following and following.get('line') == 'join'):
             result.append(group)
             group = []
     if group:

@@ -23,7 +23,7 @@ STATUS_LABELS = {'pending': 'Pending', 'approved': 'Approved', 'needs_changes': 
 OPTIONS = ('recut', 'fix_framing')
 OPTION_LABELS = {'recut': 'Re-cut (start/end)', 'fix_framing': 'Fix framing'}
 MAX_COMMENT = 4000
-MAX_SHIFT = 30.0  # seconds a reviewer can move a clip edge from the editor
+MAX_SHIFT = 24*3600.0  # sanity bound only; the editor server keeps edges inside the source
 MAX_OVERRIDES = 200
 _LOCK = threading.Lock()  # serializes decisions-file reads and writes across server threads
 
@@ -127,7 +127,7 @@ def validate_update(update):
     for name in ('start_shift', 'end_shift'):
         value = update.get(name, 0)
         if not _number(value) or abs(value) > MAX_SHIFT:
-            raise ValueError(f'{name} must be a number of seconds within ±{MAX_SHIFT:g}.')
+            raise ValueError(f'{name} must be a number of seconds.')
         shifts[name] = round(float(value), 3)
     return {'status': status, 'options': [o for o in OPTIONS if o in options], 'comment': comment.strip(), **shifts,
             'focus_overrides': validate_overrides(update.get('focus_overrides'))}

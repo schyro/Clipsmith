@@ -20,6 +20,32 @@ async function request(path, body) {
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const frameOf = (t, start) => Math.floor((t - start) * FPS + 1e-6);
+const CONTEXTS = [3, 30, 120, 600]; // timeline padding around the cut, in seconds
+
+// The source's own frames and the render's 30 fps grid (same rules as frame_grid.py).
+// A render of a cut starts at the first source frame at or after its start (the
+// origin); source frame i first appears at grid frame round((pts[i] - pts[origin]) * 30),
+// and grid frame n shows the last source frame whose slot is at most n. The proxy keeps
+// the source frames and timestamps, so the frame on screen is known exactly.
+function makeGrid(data) {
+  const [num, den] = data.time_base;
+  const pts = data.pts;
+  const offset = data.start_time * den / num;
+  const firstAtLeast = (x) => { let lo = 0, hi = pts.length; while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m] < x) lo = m + 1; else hi = m; } return lo; };
+  const firstAbove = (x) => { let lo = 0, hi = pts.length; while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m] <= x) lo = m + 1; else hi = m; } return lo; };
+  const grid = {
+    count: pts.length,
+    seconds: (i) => pts[clamp(i, 0, pts.length - 1)] * num / den,
+    origin: (start) => Math.min(firstAtLeast(Math.ceil(start * den / num + offset - 1e-6)), pts.length - 1),
+    slot: (i, origin) => Math.floor((2 * (pts[i] - pts[origin]) * num * FPS + den) / (2 * den)),
+    shown: (n, origin) => Math.max(0, firstAbove(pts[origin] + Math.ceil(den * (2 * n + 1) / (2 * FPS * num) - 1e-7) - 1) - 1),
+    // The source frame a video element shows at media time t: the last one starting by t.
+    // Browsers keep media times in microseconds, hence the 5 µs allowance.
+    at: (t) => Math.max(0, firstAbove(Math.floor((t + 5e-6) * den / num)) - 1),
+  };
+  grid.frameTime = (n, origin) => grid.seconds(grid.shown(n, origin));
+  return grid;
+}
 
 function fmt(t, digits = 2) {
   if (t == null || !isFinite(t)) return '–';
@@ -116,16 +142,55 @@ function LivePreview({ ctx, videoRef, onTime, onFrameDraw, onDragCenter }) {
   const sh = (focus ? focus.scaled_height : settings.height) * ds;
   const sizeRef = useRef();
   sizeRef.current = { ds, sw, sh, w: settings.width * ds };
+  const canvasRef = useRef();
 
-  const paint = useCallback((t) => {
-    const c = live.current, v = videoRef.current, sz = sizeRef.current;
-    if (!v || !sz.ds) return;
-    const frame = frameOf(t, c.clip.start);
+  // Takes the frame the video element holds together with its own timestamp, and draws
+  // it cropped onto the canvas. The picture and its crop reach the screen in the same
+  // paint, so a late callback can delay a frame but never show it with another frame's
+  // crop (a CSS transform on the video was applied apart from the video frame itself).
+  const grab = () => {
+    const v = videoRef.current;
+    if (!v || v.readyState < 2) return null;
+    if (typeof VideoFrame === 'function') {
+      try { const f = new VideoFrame(v); return { image: f, t: f.timestamp / 1e6, close: () => f.close() }; } catch (e) { /* fall back */ }
+    }
+    return { image: v, t: v.currentTime, close: () => {} };
+  };
+
+  const paint = useCallback(() => {
+    const c = live.current, canvas = canvasRef.current, box = boxRef.current;
+    // Measured here rather than taken from layout state, which can lag behind the box.
+    const bw = box ? box.clientWidth : 0, bh = box ? box.clientHeight : 0;
+    if (!canvas || !bw || !bh) return;
+    const shot = grab();
+    if (!shot) return;
+    const t = shot.t;
+    // The crop and the captions follow the source frame on screen, at the grid frame
+    // where the render shows that frame: framing in the clip's grid, captions in the cut's.
+    let frame, ct;
+    if (c.grid) {
+      const i = c.grid.at(t);
+      frame = c.grid.slot(i, c.clipOrigin);
+      ct = c.grid.slot(i, c.cutOrigin) / FPS + 1e-6;
+    } else {
+      frame = frameOf(t, c.clip.start);
+      ct = frameOf(t, c.cut.start) / FPS + 1e-6;
+    }
     const center = centerAt(frame, c.focus, c.overrides);
-    const x = clamp(center * sz.sw - sz.w / 2, 0, sz.sw - sz.w);
-    v.style.transform = `translate(${-x}px, ${-(sz.sh - c.settings.height * sz.ds) / 2}px)`;
-    // Captions are evaluated at the render's frame times (the cut's 30 fps grid).
-    const ct = frameOf(t, c.cut.start) / FPS + 1e-6;
+    // Crop in the source picture's own pixels: the output window is width x height of the
+    // picture scaled to scaled_width x scaled_height, centred vertically.
+    const iw = shot.image.displayWidth || shot.image.videoWidth, ih = shot.image.displayHeight || shot.image.videoHeight;
+    const scaledW = c.focus ? c.focus.scaled_width : c.settings.width * 16 / 9;
+    const scaledH = c.focus ? c.focus.scaled_height : c.settings.height;
+    const k = ih / scaledH;
+    const x = clamp(center * scaledW - c.settings.width / 2, 0, scaledW - c.settings.width);
+    const dpr = window.devicePixelRatio || 1;
+    const cw = Math.round(bw * dpr), chh = Math.round(bh * dpr);
+    if (canvas.width !== cw || canvas.height !== chh) { canvas.width = cw; canvas.height = chh; }
+    const g = canvas.getContext('2d');
+    g.drawImage(shot.image, x * k, (scaledH - c.settings.height) / 2 * k, c.settings.width * k, c.settings.height * k, 0, 0, cw, chh);
+    onFrameDraw && onFrameDraw(t, center, shot.image);
+    shot.close();
     const hit = ct >= 0 && t < c.cut.end ? captionAt(c.groups, ct) : null;
     const key = hit ? `${hit.g}:${hit.i}:${c.groupsVersion}` : '';
     const el = capRef.current;
@@ -136,23 +201,22 @@ function LivePreview({ ctx, videoRef, onTime, onFrameDraw, onDragCenter }) {
       if (enter) { el.classList.remove('enter'); void el.offsetWidth; el.classList.add('enter'); }
     }
     boxRef.current && boxRef.current.classList.toggle('outside', t < c.cut.start - 1e-3 || t >= c.cut.end);
-    onFrameDraw && onFrameDraw(t, center);
+    return t;
   }, []);
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     let handle, raf, last = 0;
-    const tick = (now, meta) => {
-      const t = meta ? meta.mediaTime : v.currentTime;
-      paint(t);
-      if (now - last > 80) { last = now; onTime(t); }
+    const tick = (now) => {
+      const t = paint();
+      if (t != null && now - last > 80) { last = now; onTime(t); }
       handle = v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : null;
     };
     if (v.requestVideoFrameCallback) handle = v.requestVideoFrameCallback(tick);
-    const loop = () => { const t = v.currentTime; paint(t); onTime(t); raf = requestAnimationFrame(loop); };
+    const loop = () => { const t = paint(); if (t != null) onTime(t); raf = requestAnimationFrame(loop); };
     if (!v.requestVideoFrameCallback) raf = requestAnimationFrame(loop);
-    const seeked = () => { paint(v.currentTime); onTime(v.currentTime); };
+    const seeked = () => { const t = paint(); onTime(t != null ? t : v.currentTime); };
     v.addEventListener('seeked', seeked);
     v.addEventListener('loadeddata', seeked);
     return () => {
@@ -163,15 +227,14 @@ function LivePreview({ ctx, videoRef, onTime, onFrameDraw, onDragCenter }) {
     };
   }, [ctx.proxyUrl]);
 
-  // Repaint when edits change the crop or captions while paused.
-  useEffect(() => { const v = videoRef.current; if (v) paint(v.currentTime); });
+  // Repaint when edits change the crop or captions while paused. While playing, only the
+  // frame callback paints.
+  useEffect(() => { const v = videoRef.current; if (v && v.paused) paint(); });
 
   const drag = useRef(null);
   const down = (e) => {
     if (!onDragCenter || !ctx.framingEditable) return;
-    const v = videoRef.current;
-    const frame = frameOf(v.currentTime, ctx.clip.start);
-    drag.current = { x: e.clientX, center: centerAt(frame, ctx.focus, ctx.overrides) };
+    drag.current = { x: e.clientX, center: centerAt(ctx.frame, ctx.focus, ctx.overrides) };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const move = (e) => {
@@ -190,8 +253,8 @@ function LivePreview({ ctx, videoRef, onTime, onFrameDraw, onDragCenter }) {
   return html`
     <div class="viewport live ${ctx.framingEditable ? 'grab' : ''}" ref=${boxRef}
          onPointerDown=${down} onPointerMove=${move} onPointerUp=${up}>
-      <video ref=${videoRef} src=${ctx.proxyUrl} preload="auto" playsinline
-             style=${{ width: sw + 'px', height: sh + 'px' }}></video>
+      <video ref=${videoRef} src=${ctx.proxyUrl} preload="auto" playsinline></video>
+      <canvas class="frame" ref=${canvasRef}></canvas>
       <div class="caption" ref=${capRef}
            style=${{ left: settings.width / 2 * ds + 'px', top: settings.subtitle_y * ds + 'px', fontSize: font + 'px',
                      '--stroke': Math.max(1, 3 * ds * 2) + 'px' }}></div>
@@ -218,12 +281,13 @@ function FileVideo({ src, videoRef, onTime, offset, label }) {
 function Overview({ videoRef, ctx, register, onSetCenter }) {
   const canvasRef = useRef();
   const drawRef = useRef();
-  drawRef.current = (t, center) => {
+  // `image` is the frame the live view just drew (a VideoFrame), so both show the same picture.
+  drawRef.current = (t, center, image) => {
     const canvas = canvasRef.current, v = videoRef.current;
-    if (!canvas || !v || !v.videoWidth) return;
+    if (!canvas || !v || (!image && !v.videoWidth)) return;
     const g = canvas.getContext('2d');
     const W = canvas.width, H = canvas.height;
-    g.drawImage(v, 0, 0, W, H);
+    g.drawImage(image || v, 0, 0, W, H);
     const f = ctx.focus;
     const frac = f ? ctx.settings.width / f.scaled_width : 0.45;
     const x = clamp(center - frac / 2, 0, 1 - frac) * W;
@@ -234,7 +298,7 @@ function Overview({ videoRef, ctx, register, onSetCenter }) {
     g.lineWidth = 2;
     g.strokeRect(x + 1, 1, frac * W - 2, H - 2);
   };
-  useEffect(() => register((t, c) => drawRef.current(t, c)), []);
+  useEffect(() => register((t, c, image) => drawRef.current(t, c, image)), []);
   const pick = (e, done) => {
     if (!ctx.framingEditable || (e.type === 'pointermove' && !e.buttons)) return;
     const r = canvasRef.current.getBoundingClientRect();
@@ -247,47 +311,64 @@ function Overview({ videoRef, ctx, register, onSetCenter }) {
 
 // ---------- timeline ----------
 
-function Timeline({ ctx, t, onSeek, onEdge, onEdgeDone, wide, onSelectWord }) {
+function Timeline({ ctx, t, onSeek, onEdge, onEdgeDone, pad, onSelectWord, selectedWord, onWordTiming }) {
   const ref = useRef();
   const { w } = useSize(ref);
   const { clip, cut, snapped, focus, words, duration } = ctx;
-  const pad = wide ? ctx.limits.context : 3;
   const a = Math.max(0, Math.min(clip.start, cut.start) - pad);
   const b = Math.min(duration, Math.max(clip.end, cut.end) + pad);
   const X = (s) => (s - a) / (b - a) * w;
   const T = (x) => a + clamp(x, 0, w) / w * (b - a);
   const drag = useRef(null);
+  const [wordDrag, setWordDrag] = useState(null);
 
-  const down = (e, kind) => {
+  const down = (e, kind, word) => {
     e.stopPropagation();
     drag.current = kind;
     ref.current.setPointerCapture(e.pointerId);
     if (kind === 'seek') onSeek(T(e.clientX - ref.current.getBoundingClientRect().left));
+    if (word) setWordDrag({ index: word.index, start: word.start, end: word.end });
   };
   const move = (e) => {
     if (!drag.current) return;
     const s = T(e.clientX - ref.current.getBoundingClientRect().left);
     if (drag.current === 'seek') onSeek(s);
+    else if (drag.current === 'wstart') setWordDrag(d => d && { ...d, start: Math.min(s, d.end - 0.04) });
+    else if (drag.current === 'wend') setWordDrag(d => d && { ...d, end: Math.max(s, d.start + 0.04) });
     else onEdge(drag.current, s);
   };
-  const up = () => { if (drag.current && drag.current !== 'seek') onEdgeDone(); drag.current = null; };
+  const up = () => {
+    const kind = drag.current;
+    drag.current = null;
+    if (kind === 'wstart' || kind === 'wend') {
+      if (wordDrag) onWordTiming(wordDrag.index, { start: Math.round(wordDrag.start * 1000) / 1000, end: Math.round(wordDrag.end * 1000) / 1000 });
+      setWordDrag(null);
+    } else if (kind && kind !== 'seek') onEdgeDone();
+  };
 
-  const step = (b - a) > 90 ? 10 : (b - a) > 30 ? 5 : 1;
+  const step = (b - a) > 900 ? 60 : (b - a) > 300 ? 30 : (b - a) > 90 ? 10 : (b - a) > 30 ? 5 : 1;
   const ticks = [];
   for (let s = Math.ceil(a / step) * step; s <= b; s += step) ticks.push(s);
   const shotRows = focus ? focus.shots.map((s, i) => {
-    const s0 = clip.start + s.start_frame / FPS, s1 = clip.start + s.end_frame / FPS;
+    const s0 = ctx.frameTime(s.start_frame), s1 = ctx.frameTime(s.end_frame);
     const over = ctx.overrides.some(o => o.start_frame < s.end_frame && o.end_frame > s.start_frame);
     return html`<div class="shot ${i % 2 ? 'odd' : ''} ${over ? 'over' : ''} ${s.review.length ? 'flag' : ''}"
       title=${`Shot ${i + 1}: frames ${s.start_frame}–${s.end_frame - 1}${s.review.length ? ' · review: ' + s.review.map(r => r.reason || r.kind || r).join(', ') : ''}`}
       style=${{ left: X(s0) + 'px', width: Math.max(1, X(s1) - X(s0)) + 'px' }}
       onPointerDown=${e => { e.stopPropagation(); onSeek(s0 + 1e-3); }}>${X(s1) - X(s0) > 22 ? i + 1 : ''}</div>`;
   }) : null;
-  const wordRows = (words || []).filter(wd => wd.end >= a && wd.start <= b).map(wd => html`
-    <div class="word ${wd.word !== wd.original ? 'edited' : ''}" title=${wd.word !== wd.original ? `${wd.original} → ${wd.word || '(removed)'}` : wd.word}
-      style=${{ left: X(wd.start) + 'px', width: Math.max(2, X(wd.end) - X(wd.start)) + 'px' }}
+  const wordRows = (words || []).filter(wd => wd.end >= a && wd.start <= b).map(wd => {
+    const timing = wordDrag && wordDrag.index === wd.index ? wordDrag : wd;
+    const sel = selectedWord === wd.index;
+    return html`
+    <div class="word ${wordEdited(wd) ? 'edited' : ''} ${wd.kind} ${sel ? 'sel' : ''} ${wd.line ? 'line-' + wd.line : ''}"
+      title=${wordTitle(wd)}
+      style=${{ left: X(timing.start) + 'px', width: Math.max(2, X(timing.end) - X(timing.start)) + 'px' }}
       onPointerDown=${e => { e.stopPropagation(); onSeek(wd.start + 1e-3); onSelectWord(wd.index); }}>
-      ${X(wd.end) - X(wd.start) > 26 ? wd.word : ''}</div>`);
+      ${sel && ctx.captionsEditable && html`<span class="wh l" title="Drag the word's start" onPointerDown=${e => down(e, 'wstart', wd)}></span>
+        <span class="wh r" title="Drag the word's end" onPointerDown=${e => down(e, 'wend', wd)}></span>`}
+      ${X(timing.end) - X(timing.start) > 26 ? wd.word : ''}</div>`;
+  });
   return html`
     <div class="timeline" ref=${ref} onPointerDown=${e => down(e, 'seek')} onPointerMove=${move} onPointerUp=${up}>
       <div class="ruler">${ticks.map(s => html`<span style=${{ left: X(s) + 'px' }}>${fmt(s, 0)}</span>`)}</div>
@@ -306,8 +387,40 @@ function Timeline({ ctx, t, onSeek, onEdge, onEdgeDone, wide, onSelectWord }) {
 
 // ---------- inspector panels ----------
 
+function wordEdited(w) {
+  return w.kind === 'added' || w.word !== w.original || w.start !== w.original_start || w.end !== w.original_end || !!w.line;
+}
+
+function wordTitle(w) {
+  const kind = { transcript: 'Transcript word', missed: 'Found by the missed-speech pass', added: 'Added in the editor' }[w.kind];
+  const parts = [`${kind} · ${fmt(w.start)}–${fmt(w.end)}`];
+  if (w.kind !== 'added' && w.word !== w.original) parts.push(`${w.original} → ${w.word || '(removed)'}`);
+  if (w.kind !== 'added' && (w.start !== w.original_start || w.end !== w.original_end)) parts.push(`retimed from ${fmt(w.original_start)}–${fmt(w.original_end)}`);
+  if (w.line) parts.push(w.line === 'break' ? 'new caption line starts here' : 'kept on the previous line');
+  return parts.join('\n');
+}
+
 function Section({ title, children, extra }) {
   return html`<section class="panel"><h3>${title}${extra && html`<span class="extra">${extra}</span>`}</h3>${children}</section>`;
+}
+
+// "1:23.45", "83.45" or "0:01:23.45" -> seconds; null when unreadable.
+function parseTime(text) {
+  const parts = String(text).trim().replace(',', '.').split(':');
+  if (!parts.length || parts.length > 3 || parts.some(p => !/^\d+(\.\d*)?$/.test(p))) return null;
+  return parts.reduce((total, p) => total * 60 + parseFloat(p), 0);
+}
+
+function TimeInput({ value, disabled, onSet }) {
+  const [draft, setDraft] = useState(null);
+  const commit = (e) => {
+    const s = parseTime(e.target.value);
+    setDraft(null);
+    if (s != null && Math.abs(s - value) > 1e-4) onSet(s);
+  };
+  return html`<input class="time mono" disabled=${disabled} value=${draft ?? fmt(value)} size="9" title="Type a time (m:ss.ss or seconds) and press Enter"
+    onInput=${e => setDraft(e.target.value)} onBlur=${commit}
+    onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); commit(e); e.target.blur(); } if (e.key === 'Escape') { setDraft(null); e.target.blur(); } }} />`;
 }
 
 function CutPanel({ ctx, t, setShift, nudgeShift, disabled }) {
@@ -316,12 +429,15 @@ function CutPanel({ ctx, t, setShift, nudgeShift, disabled }) {
     const base = clip[edge], shift = entry[edge + '_shift'] || 0;
     const nudge = (d) => nudgeShift(edge, d);
     return html`<div class="edge">
-      <div class="edge-head"><b>${label}</b> <span class="mono">${fmt(base + shift)}</span> <span class="muted">${signed(shift)}</span></div>
+      <div class="edge-head"><b>${label}</b> <${TimeInput} value=${base + shift} disabled=${disabled} onSet=${s => setShift(edge, s - base)} />
+        <span class="muted">${signed(shift)}</span></div>
       <div class="buttons">
+        <button disabled=${disabled} onClick=${() => nudge(-5)}>−5 s</button>
         <button disabled=${disabled} onClick=${() => nudge(-0.5)}>−0.5 s</button>
         <button disabled=${disabled} onClick=${() => nudge(-1 / FPS)}>−1 f</button>
         <button disabled=${disabled} onClick=${() => nudge(1 / FPS)}>+1 f</button>
         <button disabled=${disabled} onClick=${() => nudge(0.5)}>+0.5 s</button>
+        <button disabled=${disabled} onClick=${() => nudge(5)}>+5 s</button>
         <button disabled=${disabled} onClick=${() => setShift(edge, t - base)} title="Shortcut: ${key}">At playhead (${key})</button>
         <button disabled=${disabled || !shift} onClick=${() => setShift(edge, 0)}>Reset</button>
       </div></div>`;
@@ -375,26 +491,87 @@ function FramingPanel({ ctx, t, frame, editShot, setFraming, overviewSlot, disab
   </${Section}>`;
 }
 
-function CaptionPanel({ ctx, t, selected, onSave, lockedNote }) {
-  const words = (ctx.words || []).filter(w => (selected != null ? Math.abs(w.index - selected) <= 6 : w.end >= t - 1.5 && w.start <= t + 3));
+const r3 = (s) => Math.round(s * 1000) / 1000;
+
+function CaptionPanel({ ctx, t, selected, onSelect, onSave, onAdd, onRetranscribe, proposals, setProposals, onAccept,
+                        editable, busy, lockedNote }) {
+  const all = ctx.words || [];
+  const pos = selected != null ? all.findIndex(w => w.index === selected) : -1;
+  const words = pos >= 0 ? all.slice(Math.max(0, pos - 6), pos + 7) : all.filter(w => w.end >= t - 1.5 && w.start <= t + 3);
+  const sel = pos >= 0 ? all[pos] : null;
   const [drafts, setDrafts] = useState({});
+  const [addText, setAddText] = useState('');
   const commit = (w, value) => {
     if (value == null || value === w.word) return;
-    onSave(w.index, value).then(() => setDrafts(d => { const n = { ...d }; delete n[w.index]; return n; }));
+    onSave(w.index, { to: value }).then(() => setDrafts(d => { const n = { ...d }; delete n[w.index]; return n; }));
   };
-  return html`<${Section} title="Captions" extra=${ctx.captionEdits ? `${ctx.captionEdits} fixes in this source` : ''}>
+  const restore = (w) => w.kind === 'added' ? onSave(w.index, { to: '' }) : onSave(w.index, { to: null, start: null, end: null, line: null });
+  const toggleLine = (w, kind) => onSave(w.index, { line: w.line === kind ? null : kind });
+  const add = () => {
+    const parts = addText.trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return;
+    // Spread the words from the playhead, about 0.3 s each, up to the next word if it is close.
+    const next = all.find(w => w.start > t + 0.01);
+    const room = next ? next.start - 0.02 - t : Infinity;
+    const total = room >= 0.15 * parts.length ? Math.min(parts.length * 0.32, room) : parts.length * 0.32;
+    const each = total / parts.length;
+    onAdd(parts.map((p, i) => ({ word: p, start: r3(t + i * each), end: r3(t + (i + 1) * each - 0.01) })))
+      .then(ok => ok && setAddText(''));
+  };
+  // The stretch without words around the playhead, for Whisper to look at again.
+  const before = [...all].reverse().find(w => w.end <= t), after = all.find(w => w.start >= t);
+  const rangeStart = Math.max(0, t - 8, Math.min(t - 1.5, before ? before.end - 0.5 : t - 4));
+  const rangeEnd = Math.min(ctx.duration, t + 8, Math.max(t + 3, after ? after.start + 0.5 : t + 4));
+  const kindTag = (w) => w.kind === 'missed' ? html`<span class="kind" title="Found by the missed-speech pass">M</span>`
+    : w.kind === 'added' ? html`<span class="kind" title="Added in the editor">+</span>` : null;
+  return html`<${Section} title="Captions" extra=${ctx.captionEdits ? `${ctx.captionEdits} edits in this source` : ''}>
     <div class="words-edit">
-      ${words.map(w => html`<label class="wordbox ${w.word !== w.original ? 'edited' : ''} ${w.index === selected ? 'sel' : ''} ${w.start <= t && t < w.end ? 'now' : ''}"
-          title=${`${fmt(w.start)} · original: ${w.original}`}>
-        <input value=${drafts[w.index] ?? w.word} size=${Math.max(3, (drafts[w.index] ?? w.word).length + 1)}
+      ${words.map(w => html`<label class="wordbox ${wordEdited(w) ? 'edited' : ''} ${w.index === selected ? 'sel' : ''} ${w.start <= t && t < w.end ? 'now' : ''} ${w.kind}"
+          title=${wordTitle(w)}>
+        ${w.line === 'break' && html`<span class="linemark" title="A new caption line starts here">↵</span>`}
+        ${w.line === 'join' && html`<span class="linemark" title="Kept on the previous line">⁀</span>`}
+        ${kindTag(w)}
+        <input value=${drafts[w.index] ?? w.word} size=${Math.max(3, (drafts[w.index] ?? w.word).length + 1)} disabled=${!editable}
+          onFocus=${() => onSelect(w.index)}
           onInput=${e => setDrafts(d => ({ ...d, [w.index]: e.target.value }))}
           onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); commit(w, e.target.value); e.target.blur(); } if (e.key === 'Escape') { e.target.value = w.word; setDrafts(d => ({ ...d, [w.index]: undefined })); e.target.blur(); } }}
           onBlur=${e => commit(w, e.target.value)} />
-        ${w.word !== w.original && html`<button class="revert" title="Restore “${w.original}”" onClick=${() => onSave(w.index, w.original)}>↺</button>`}
+        ${editable && wordEdited(w) && w.kind !== 'added' && html`<button class="revert" title="Restore the original word and timing" onClick=${() => restore(w)}>↺</button>`}
       </label>`)}
       ${!words.length && html`<p class="note muted">No words near the playhead.</p>`}
     </div>
-    <p class="note muted">Press Enter to save a word; an empty word removes it. Fixes apply to every clip of this source on the next Apply.${lockedNote}</p>
+    ${sel && html`<div class="word-tools">
+      <div><b>${sel.word || '(removed)'}</b> <span class="mono">${fmt(sel.start)}–${fmt(sel.end)}</span>
+        <span class="muted">${{ transcript: 'transcript', missed: 'missed-speech pass', added: 'added' }[sel.kind]}</span>
+        <button class="link" onClick=${() => onSelect(null)}>Deselect</button></div>
+      <div class="buttons">
+        <button disabled=${!editable} onClick=${() => onSave(sel.index, t < sel.end ? { start: r3(t) } : { start: r3(t), end: r3(t + sel.end - sel.start) })}>Start at playhead</button>
+        <button disabled=${!editable || t <= sel.start} onClick=${() => onSave(sel.index, { end: r3(t) })}>End at playhead</button>
+        <button disabled=${!editable} class=${sel.line === 'break' ? 'on' : ''} onClick=${() => toggleLine(sel, 'break')} title="Start a new caption line at this word">New line here</button>
+        <button disabled=${!editable} class=${sel.line === 'join' ? 'on' : ''} onClick=${() => toggleLine(sel, 'join')} title="Keep this word on the previous caption line">Join previous line</button>
+        <button disabled=${!editable || !wordEdited(sel)} onClick=${() => restore(sel)}>${sel.kind === 'added' ? 'Delete word' : 'Restore original'}</button>
+      </div>
+      <p class="note muted">Drag the word's edges on the timeline to retime it.</p></div>`}
+    <div class="add-words">
+      <input placeholder="Add words at the playhead…" value=${addText} disabled=${!editable}
+        onInput=${e => setAddText(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
+      <button disabled=${!editable || !addText.trim()} onClick=${add}>Add</button>
+    </div>
+    <div class="buttons">
+      <button disabled=${!editable || busy} onClick=${() => onRetranscribe(rangeStart, rangeEnd)}
+        title="Run Whisper again on ${fmt(rangeStart)}–${fmt(rangeEnd)} and propose the words it hears">Re-transcribe around the playhead</button>
+    </div>
+    ${proposals && html`<div class="proposals">
+      <p class="note">Whisper heard in ${fmt(proposals.start)}–${fmt(proposals.end)}${proposals.words.length ? '' : ': nothing'}.
+        Words that overlap an existing word start unticked.</p>
+      ${proposals.words.map((p, i) => html`<label class="prop ${p.overlaps ? 'overlap' : ''}">
+        <input type="checkbox" checked=${p.on} onChange=${e => setProposals(ps => ({ ...ps, words: ps.words.map((q, j) => j === i ? { ...q, on: e.target.checked } : q) }))} />
+        <input value=${p.word} size=${Math.max(3, p.word.length + 1)} onInput=${e => setProposals(ps => ({ ...ps, words: ps.words.map((q, j) => j === i ? { ...q, word: e.target.value } : q) }))} />
+        <span class="muted mono">${fmt(p.start)}</span></label>`)}
+      <div class="buttons">
+        <button class="primary" disabled=${!editable || !proposals.words.some(p => p.on && p.word.trim())} onClick=${onAccept}>Add ticked words</button>
+        <button onClick=${() => setProposals(null)}>Dismiss</button></div></div>`}
+    <p class="note muted">Enter saves a word; an empty word removes it. Edits apply to every clip of this source on the next Apply.${lockedNote}</p>
   </${Section}>`;
 }
 
@@ -411,7 +588,10 @@ function App() {
   const [mode, setMode] = useState('live');
   const [t, setT] = useState(0);
   const [loop, setLoop] = useState(false);
-  const [wide, setWide] = useState(false);
+  const [ctxLevel, setCtxLevel] = useState(0);
+  const [grid, setGrid] = useState(null);
+  const [proposals, setProposals] = useState(null);
+  const [captionsVersion, setCaptionsVersion] = useState(0);
   const [filter, setFilter] = useState('all');
   const [job, setJob] = useState(null);
   const [showLog, setShowLog] = useState(false);
@@ -445,6 +625,10 @@ function App() {
     } catch (e) { setError('The editor server is not reachable: ' + e.message); }
   }, []);
   useEffect(() => { load(); }, []);
+  // The source's frame timestamps, for the exact live crop (once per session).
+  useEffect(() => {
+    request('frames').then(d => setGrid(makeGrid(d))).catch(e => notify('Frame times: ' + e.message, 'bad'));
+  }, []);
 
   // Poll the background job while it runs; reload everything when it ends.
   useEffect(() => {
@@ -457,6 +641,8 @@ function App() {
           clearInterval(timer);
           await load();
           if (j.state === 'done' && j.kind === 'preview') setMode('preview');
+          if (j.state === 'done' && j.kind === 'transcribe') showProposals();
+          if (j.kind === 'prepare') setCaptionsVersion(v => v + 1);
           notify(j.state === 'done' ? `${j.kind[0].toUpperCase() + j.kind.slice(1)} finished.` : `${j.kind} failed: ${j.error}`, j.state === 'done' ? 'ok' : 'bad');
         }
       } catch (e) { /* keep polling */ }
@@ -471,6 +657,12 @@ function App() {
   const focus = clip && focusCache[clip.key];
   const cut = clip ? { start: clip.start + (entry.start_shift || 0), end: clip.end + (entry.end_shift || 0) } : null;
   const effectiveCut = snapped && !snapped.error ? snapped : cut;
+  // Grid origins: framing uses the current clip's frames, captions the cut that would be applied.
+  const clipOrigin = grid && clip ? grid.origin(clip.start) : null;
+  const cutOrigin = grid && effectiveCut ? grid.origin(effectiveCut.start) : null;
+  const frameTime = (n) => grid && clipOrigin != null ? grid.frameTime(n, clipOrigin) : clip.start + n / FPS;
+  // In Live, the first source frame a render of a cut starting at `start` shows (it can start a little after it).
+  const firstFrame = (start) => mode === 'live' && grid ? grid.seconds(grid.origin(start)) + 5e-4 : start;
 
   // Focus data per clip.
   useEffect(() => {
@@ -496,17 +688,17 @@ function App() {
   useEffect(() => {
     if (!clip || capStart == null) return;
     const timer = setTimeout(() => {
-      request(`clips/${encodeURIComponent(clip.key)}/captions?start=${capStart}&end=${capEnd}`)
+      request(`clips/${encodeURIComponent(clip.key)}/captions?start=${capStart}&end=${capEnd}&context=${CONTEXTS[ctxLevel]}`)
         .then(c => { setCaptions(c); setGroupsVersion(v => v + 1); }).catch(e => notify('Captions: ' + e.message, 'bad'));
     }, 150);
     return () => clearTimeout(timer);
-  }, [clip && clip.key, capStart, capEnd, data && data.caption_edits]);
+  }, [clip && clip.key, capStart, capEnd, data && data.caption_edits, captionsVersion, ctxLevel]);
 
   // When the selected clip changes, park the playhead at its start.
   useEffect(() => {
     if (!clip) return;
     setSelWord(null);
-    setTimeout(() => seek(clip.start), 0);
+    setTimeout(() => seek(firstFrame(clip.start)), 0);
   }, [clip && clip.key, mode]);
 
   useEffect(() => {
@@ -572,23 +764,23 @@ function App() {
     edit({ status: latest().status === status ? 'pending' : status });
   };
 
+  // An edge can move anywhere in the source; the cut stays between 3 and 180 seconds.
   const setShift = (edge, value, immediate = true) => {
-    const max = data.limits.max_shift;
-    value = clamp(Math.round(value * 1000) / 1000, -max, max);
     const now = latest();
     const other = edge === 'start' ? clip.end + (now.end_shift || 0) : clip.start + (now.start_shift || 0);
-    const pos = clip[edge] + value;
-    if (edge === 'start' && other - pos < 3) value = other - 3 - clip.start;
-    if (edge === 'end' && pos - other < 3) value = other + 3 - clip.end;
-    if (edge === 'start' && clip.start + value < 0) value = -clip.start;
-    if (edge === 'end' && clip.end + value > data.source.duration) value = data.source.duration - clip.end;
-    stage('recut', { [edge + '_shift']: Math.round(value * 1000) / 1000 }, immediate);
+    let pos = Math.round((clip[edge] + value) * 1000) / 1000;
+    if (edge === 'start') pos = clamp(pos, Math.max(0, other - 180), other - 3);
+    else pos = clamp(pos, other + 3, Math.min(data.source.duration, other + 180));
+    stage('recut', { [edge + '_shift']: Math.round((pos - clip[edge]) * 1000) / 1000 }, immediate);
   };
 
   const nudgeShift = (edge, d) => setShift(edge, Math.round(((latest()[edge + '_shift'] || 0) + d) * 1000) / 1000);
 
   const overrides = clip ? overridesFor(clip, entry) : [];
-  const frame = clip ? frameOf(t, clip.start) : 0;
+  // Live: the grid frame where the render shows the source frame on screen. File modes:
+  // the file's own 30 fps frame.
+  const frame = !clip ? 0 : mode === 'live' && grid && clipOrigin != null ? grid.slot(grid.at(t), clipOrigin)
+    : frameOf(t, mode === 'preview' && clip.preview ? clip.preview.start : clip.start);
 
   const setFraming = (list) => {
     if (list === null) edit({ focus_overrides: null });
@@ -625,13 +817,44 @@ function App() {
     editShot(index, { [panEnd ? 'center_x_end' : 'center_x']: center }, done, true);
   };
 
-  const saveCaption = async (index, to) => {
+  const captionsSaved = async (text) => {
+    const d = await request('state');
+    setData(d);
+    setCaptionsVersion(v => v + 1);
+    notify(text, 'ok');
+  };
+  const saveCaption = async (index, changes) => {
     try {
-      await request('captions', { index, to });
-      const d = await request('state');
-      setData(d);
-      notify('Caption word saved.', 'ok');
-    } catch (e) { notify('Caption not saved: ' + e.message, 'bad'); }
+      await request('captions', { index, ...changes });
+      await captionsSaved('Caption saved.');
+      return true;
+    } catch (e) { notify('Caption not saved: ' + e.message, 'bad'); return false; }
+  };
+  const addCaptionWords = async (words) => {
+    try {
+      const r = await request('captions/add', { words });
+      await captionsSaved(`${r.ids.length} word(s) added.`);
+      return true;
+    } catch (e) { notify('Words not added: ' + e.message, 'bad'); return false; }
+  };
+  const runRetranscribe = async (start, end) => {
+    try { setProposals(null); setJob(await request('retranscribe', { start, end })); } catch (e) { notify(e.message, 'bad'); }
+  };
+  const showProposals = async () => {
+    try {
+      const r = await request('retranscribe');
+      const existing = (captions && captions.words) || [];
+      // A proposal that mostly overlaps a word the captions already have starts unticked.
+      const words = r.words.map(p => {
+        const overlaps = existing.some(w => Math.min(w.end, p.end) - Math.max(w.start, p.start) > 0.5 * (p.end - p.start));
+        return { ...p, overlaps, on: !overlaps };
+      });
+      setProposals({ start: r.start, end: r.end, words });
+    } catch (e) { notify('Re-transcription: ' + e.message, 'bad'); }
+  };
+  const acceptProposals = async () => {
+    const chosen = proposals.words.filter(p => p.on && p.word.trim()).map(p => ({ word: p.word.trim(), start: p.start, end: p.end }));
+    if (await addCaptionWords(chosen)) setProposals(null);
   };
 
   // ----- playback -----
@@ -650,7 +873,7 @@ function App() {
     const v = activeVideo();
     if (!v) return;
     if (!v.paused) { v.pause(); leftVideo.current && leftVideo.current.pause(); return; }
-    if (mode === 'live' && (t < effectiveCut.start - 0.05 || t >= effectiveCut.end - 0.05)) seek(effectiveCut.start);
+    if (mode === 'live' && (t < effectiveCut.start - 0.05 || t >= effectiveCut.end - 0.05)) seek(firstFrame(effectiveCut.start));
     v.play();
     leftVideo.current && leftVideo.current.play();
   };
@@ -659,7 +882,7 @@ function App() {
     if (mode !== 'live' || !effectiveCut) return;
     const v = liveVideo.current;
     if (!v || v.paused) return;
-    if (t >= effectiveCut.end) { if (loop) seek(effectiveCut.start); else v.pause(); }
+    if (t >= effectiveCut.end) { if (loop) seek(firstFrame(effectiveCut.start)); else v.pause(); }
   }, [t]);
   // Keep the compare pair in step.
   useEffect(() => {
@@ -676,18 +899,20 @@ function App() {
   const keyRef = useRef();
   keyRef.current = (e) => {
     if (!clip || e.target.closest('input, textarea, select') || e.ctrlKey || e.metaKey || e.altKey) return;
-    const shots = focus ? focus.shots.map(s => clip.start + s.start_frame / FPS) : [];
+    const shots = focus ? focus.shots.map(s => frameTime(s.start_frame)) : [];
     const k = e.key;
+    // Live steps through the source's own frames (a render shows some of them twice).
+    const step = (d) => mode === 'live' && grid ? seek(grid.seconds(grid.at(t) + d) + 5e-4) : seek(t + d / FPS);
     const act = {
       ' ': playCut,
-      ArrowLeft: () => seek(t - (e.shiftKey ? 1 : 1 / FPS)),
-      ArrowRight: () => seek(t + (e.shiftKey ? 1 : 1 / FPS)),
+      ArrowLeft: () => e.shiftKey ? seek(t - 1) : step(-1),
+      ArrowRight: () => e.shiftKey ? seek(t + 1) : step(1),
       ArrowUp: () => moveClip(-1), ArrowDown: () => moveClip(1),
       i: () => setShift('start', t - clip.start), o: () => setShift('end', t - clip.end),
       '[': () => { const prev = shots.filter(s => s < t - 0.02).pop(); seek(prev ?? effectiveCut.start); },
       ']': () => { const next = shots.find(s => s > t + 0.02); if (next != null) seek(next + 1e-3); },
-      Home: () => seek(effectiveCut.start), End: () => seek(effectiveCut.end - 1 / FPS),
-      l: () => setLoop(v => !v), w: () => setWide(v => !v),
+      Home: () => seek(firstFrame(effectiveCut.start)), End: () => seek(effectiveCut.end - 1 / FPS),
+      l: () => setLoop(v => !v), w: () => setCtxLevel(v => (v + 1) % CONTEXTS.length),
       f: () => { const i = shotIndexAt(focus, frame); if (i >= 0 && framingEditable) editShot(i, {}, true, true); },
       a: () => setStatus('approved'), n: () => setStatus('needs_changes'), x: () => setStatus('rejected'),
       1: () => data.source.proxy_url && setMode('live'), 2: () => setMode('rendered'),
@@ -751,6 +976,7 @@ function App() {
     words: captions && captions.words, groups: (captions && captions.groups) || [], groupsVersion,
     highlight: assColor(data.settings.highlight), proxyUrl: data.source.proxy_url, captionEdits: data.caption_edits,
     framingEditable, overrideActive: overrides.some(o => frame >= o.start_frame && frame < o.end_frame),
+    grid, clipOrigin, cutOrigin, frame, frameTime, captionsEditable: !applying,
   };
   ctx.cut = effectiveCut ? { ...effectiveCut } : cut;
   const timelineCtx = { ...ctx, cut, snapped };
@@ -764,9 +990,9 @@ function App() {
   if (mode === 'live') {
     stageView = data.source.proxy_url
       ? html`<${LivePreview} ctx=${ctx} videoRef=${liveVideo} onTime=${setT}
-          onFrameDraw=${(tt, c) => { lastFrame.current = [tt, c]; overviewDraw.current && overviewDraw.current(tt, c); }} onDragCenter=${dragCenter} />`
-      : html`<div class="viewport empty"><p>The live preview needs a low-resolution proxy of the source.</p>
-          ${jobRunning && job.kind === 'proxy' ? html`<p>Creating it… ${job.progress != null ? Math.round(job.progress * 100) + '%' : ''}</p>`
+          onFrameDraw=${(tt, c, image) => { lastFrame.current = [tt, c]; overviewDraw.current && overviewDraw.current(tt, c, image); }} onDragCenter=${dragCenter} />`
+      : html`<div class="viewport empty"><p>The live preview needs a low-resolution proxy that keeps the source's own frames.</p>
+          ${jobRunning && (job.kind === 'proxy' || job.kind === 'prepare') ? html`<p>Creating it… ${job.progress != null ? Math.round(job.progress * 100) + '%' : ''}</p>`
             : html`<button class="primary" disabled=${jobRunning} onClick=${runProxy}>Create proxy</button>`}</div>`;
   } else if (mode === 'rendered') {
     stageView = html`<${FileVideo} src=${clip.video_url} videoRef=${fileVideo} onTime=${setT} offset=${clip.start} label="Rendered" />`;
@@ -821,14 +1047,15 @@ function App() {
              ['compare', 'Compare', !!(clip.history_url || clip.preview_url)]].map(([k, label, ok], i) => html`
             <button class=${mode === k ? 'on' : ''} disabled=${!ok} onClick=${() => setMode(k)} title=${`Shortcut: ${i + 1}`}>${label}</button>`)}
         </div>
-        <label class="check"><input type="checkbox" checked=${wide} onChange=${e => setWide(e.target.checked)} />Context (W)</label>
+        <button onClick=${() => setCtxLevel(v => (v + 1) % CONTEXTS.length)} title="Timeline context around the cut (W)">
+          Context ±${CONTEXTS[ctxLevel] >= 60 ? CONTEXTS[ctxLevel] / 60 + ' min' : CONTEXTS[ctxLevel] + ' s'} (W)</button>
       </div>
     </main>
 
     <div class="tl">
-      <${Timeline} ctx=${timelineCtx} t=${t} wide=${wide} onSeek=${seek}
+      <${Timeline} ctx=${timelineCtx} t=${t} pad=${CONTEXTS[ctxLevel]} onSeek=${seek}
         onEdge=${(edge, s) => setShift(edge, s - clip[edge], false)} onEdgeDone=${() => save(clip.key, true)}
-        onSelectWord=${setSelWord} />
+        onSelectWord=${setSelWord} selectedWord=${selWord} onWordTiming=${saveCaption} />
     </div>
 
     <aside class="insp">
@@ -851,7 +1078,9 @@ function App() {
       <${FramingPanel} ctx=${ctx} t=${t} frame=${frame} editShot=${editShot} setFraming=${setFraming} disabled=${locked || applying}
         overviewSlot=${mode === 'live' && data.source.proxy_url ? html`<${Overview} videoRef=${liveVideo} ctx=${ctx}
           register=${fn => { overviewDraw.current = fn; if (lastFrame.current) setTimeout(() => fn(...lastFrame.current), 0); }} onSetCenter=${dragCenter} />` : null} />
-      <${CaptionPanel} ctx=${ctx} t=${t} selected=${selWord} onSave=${saveCaption} lockedNote=${lockedClipNote} />
+      <${CaptionPanel} ctx=${ctx} t=${t} selected=${selWord} onSelect=${setSelWord} onSave=${saveCaption} onAdd=${addCaptionWords}
+        onRetranscribe=${runRetranscribe} proposals=${proposals} setProposals=${setProposals} onAccept=${acceptProposals}
+        editable=${!applying} busy=${jobRunning} lockedNote=${lockedClipNote} />
     </aside>
 
     ${showLog && job && html`<div class="drawer">
@@ -869,7 +1098,7 @@ function App() {
         ['Space', 'Play or pause the cut'], ['← / →', 'One frame (Shift: one second)'], ['I / O', 'Set start / end at the playhead'],
         ['[ / ]', 'Previous / next camera cut'], ['Home / End', 'Start / end of the cut'], ['↑ / ↓', 'Previous / next clip'],
         ['F', 'Override the framing of the current shot'], ['A / N / X', 'Approve / needs changes / reject'],
-        ['1–4', 'Live / rendered / preview / compare'], ['L', 'Loop'], ['W', 'Wide timeline context'], ['?', 'This help']]
+        ['1–4', 'Live / rendered / preview / compare'], ['L', 'Loop'], ['W', 'Timeline context: ±3 s, ±30 s, ±2 min, ±10 min'], ['?', 'This help']]
         .map(([k, d]) => html`<tr><td><kbd>${k}</kbd></td><td>${d}</td></tr>`)}</table>
     </div></div>`}
     ${toast && html`<div class="toast ${toast.kind}">${toast.text}</div>`}

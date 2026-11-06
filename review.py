@@ -39,7 +39,7 @@ def prepare_review(source, fingerprint, cache, transcript, duration, plan_path):
              '"why_not_more" where AGENTS.md, step 3 asks for it; the render refuses a plan without them.',
              'Check boundaries against word timing and nearby frames; do not cut off setup, payoff or a spoken word.',
              'Framing always fills 4:5 without widening or padding. Local Light-ASD scores synchronized audio/face tracks. Review uncertain speaker choices and use focus_overrides with exact clip-relative start_frame/end_frame (30 fps), center_x and optional center_x_end. Never cross a camera cut or target an offscreen face early. Per-clip focus sidecars list exact cut frames.',
-             f'Caption corrections: {cache/("caption-edits-"+transcript["model"]+".json")}. Schema: {{"model":"'+transcript['model']+'","edits":[{"index":0,"from":"original stripped word","to":"corrected word"}]}. Indices are global, zero-based in words.json; preserve word times.',
+             f'Caption corrections: {cache/("caption-edits-"+transcript["model"]+".json")}. Schema: {{"model":"'+transcript['model']+'","edits":[{"index":0,"from":"original stripped word","to":"corrected word"}]}. Use each word\'s "index" from words.json: a number for transcript words, a "g" id for words the missed-speech pass found. Preserve word times.',
              '', '## Contact sheets',*sheets,'','## Full English dialogue']
     from selection import block_label, block_start
     block = None
@@ -52,7 +52,8 @@ def prepare_review(source, fingerprint, cache, transcript, duration, plan_path):
     review_path = folder/'review.md'
     review_path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
     words = [w for s in transcript['segments'] for w in s.get('words',[])]
-    (folder/'words.json').write_text(json.dumps([{'index':i,**w} for i,w in enumerate(words)],ensure_ascii=False,indent=2),encoding='utf-8')
+    words.sort(key=lambda w: w['start'])
+    (folder/'words.json').write_text(json.dumps([{**w,'index':w.get('index',i)} for i,w in enumerate(words)],ensure_ascii=False,indent=2),encoding='utf-8')
     selection = json.loads(plan_path.read_text(encoding='utf-8-sig')).get('selection') if plan_path.exists() else None
     entry = {'source':str(source),'source_id':fingerprint,'duration':duration,'review':str(review_path),
              'contact_sheets':sheets,'plan':str(plan_path),'selection':selection,

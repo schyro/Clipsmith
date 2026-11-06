@@ -44,13 +44,21 @@ A plain run uses keyword/question/speech-density proposals for new sources. This
 
 Whisper medium runs locally and caches word timestamps per source. With an NVIDIA GPU and the CUDA libraries from `requirements-gpu.txt` (installed by the launcher when `nvidia-smi` is available), it runs on the GPU in float16, several times faster than on the CPU (in testing, a 45-minute recording took about 2 minutes instead of 12). A short test transcription in a child process decides this; without a working GPU, Whisper uses the CPU in int8. Set `CLIPSMITH_WHISPER_DEVICE=cpu` to skip the GPU libraries and always use the CPU. A cached transcript is never redone, so switching devices does not change the word indices of existing caption corrections. Non-English recordings use Whisper's English translation, which requires additional language/timing review. The video is not uploaded to a cloud editing service.
 
-`Review/<id>/words.json` contains global zero-based word indices. Preserve timing while correcting recognition errors in `work/<id>/caption-edits-medium.json`:
+**Missed speech.** The long-form pass sometimes drops short or quiet lines (a whispered "Oh, God.") or skips a passage. After transcription, `missed_speech.py` looks at every stretch of at least a second without a recognised word: a sensitive VAD finds speech there, Whisper transcribes a short window around it without VAD, and words inside the gap from confident segments are kept. Whisper's typical hallucinations in silence ("Thanks for watching!") come with a high no-speech probability and are dropped, and so is a word that repeats its neighbour at a gap edge. The result is cached as `work/<id>/transcript-medium-gaps.json` with its own word ids (`g0`, `g1`, ...) and merged wherever the transcript is used; the transcript file and its word indices never change. It runs once per source (about a minute on a GPU for a 45-minute episode), during `--prepare-review`, the first render, or the clip editor's background preparation.
+
+`Review/<id>/words.json` lists every word with its `index`: a zero-based number for transcript words, a `g` id for missed-speech words. Correct recognition errors in `work/<id>/caption-edits-medium.json`, preserving timing:
 
 ```json
-{"model":"medium","edits":[{"index":123,"from":"Jon.","to":"John."}]}
+{"model":"medium","edits":[{"index":123,"from":"Jon.","to":"John."},{"index":"g7","from":"God.","to":"God!"}]}
 ```
 
-The expected original word must match. Each MP4 has an English SRT sidecar; the animated, highlighted appearance is burned into the MP4.
+`from` must match the recognised word. The clip editor writes the same file and may also set `start`/`end` (new word timing in source seconds) and `line` (`"break"` starts a new caption line at the word, `"join"` keeps it on the previous line; a line never grows past 34 characters) on an edit, and keeps words typed or accepted in the editor under `"added": [{"id": "u1", "start": 335.96, "end": 336.4, "word": "God."}]`. Each MP4 has an English SRT sidecar; the animated, highlighted appearance is burned into the MP4.
+
+## Frame grid and camera cuts
+
+Analysis, rendering and the clip editor share one exact 30 fps grid per clip (`frame_grid.py`): a clip starts at the first source frame at or after its start, source frame *i* first appears at grid frame round((pts[*i*] − pts[origin]) × 30), and grid frame *n* shows the last source frame whose slot is at most *n*. A test checks this against FFmpeg itself. Moving a clip's start carries frame-indexed `focus_overrides` to the same source frames.
+
+Before a clip renders, an edge that leaves fewer than 12 frames (0.4 s) of a neighbouring camera shot moves onto the camera cut, unless that would cut a spoken word (`shot_edges.py`); otherwise the clip would open or close with a flash of that shot. The run prints each move, and each edge it had to leave, and writes the moved edges back to the plan. Approved (locked) clips keep their edges.
 
 ## Installation and verification
 

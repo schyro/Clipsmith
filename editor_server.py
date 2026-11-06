@@ -1,8 +1,9 @@
 """Local clip editor server (`run.cmd --review-gallery`).
 
 Serves the editor from `editor/`, media from `Output` and `Review`, and a JSON
-API that stages review decisions in `review-decisions.json`, saves caption word
-fixes and runs one background job at a time (Apply, preview render, proxy).
+API that stages review decisions in `review-decisions.json`, saves caption
+edits and runs one background job at a time (Apply, preview render, prepare:
+proxy and missed-speech pass, re-transcribing a range).
 It listens on 127.0.0.1 only.
 """
 from __future__ import annotations
@@ -112,6 +113,10 @@ class State:
         self._words = self._transcript = None
         self._focus = {}
 
+    def grid(self):
+        from frame_grid import load_grid
+        return load_grid(self.source, self.cache)
+
     def load(self, output: Path):
         with self.lock:
             self.output = output
@@ -145,7 +150,8 @@ class State:
         from shorts import english_transcript
         with self.lock:
             if self._transcript is None:
-                self._transcript = english_transcript(self.source, self.cache, MODEL)
+                # The missed-speech pass runs as the background "prepare" job, not in a request.
+                self._transcript = english_transcript(self.source, self.cache, MODEL, find_missed=False)
             return self._transcript
 
     def words(self):
@@ -166,9 +172,10 @@ class State:
         return load_decisions(self.output) or empty_decisions(self.plan, self.output.name)
 
     def payload(self, job):
+        from missed_speech import gaps_path
         from review_apply import history_file
-        from shorts import clip_stem
         edits = editor_ops.edits_path(self.cache, MODEL)
+        gaps = gaps_path(self.cache, MODEL, editor_ops.task_of(self.source, self.cache, MODEL))
         clips_mtime = (self.output/'clips.json').stat().st_mtime
         previews = editor_ops.preview_dir(self.root, self.source_id)
         proxy = editor_ops.proxy_path(self.root, self.source_id)
@@ -187,15 +194,29 @@ class State:
                           'preview': json.loads(meta.read_text(encoding='utf-8')) if meta.exists() else None,
                           'locked': bool(clip.get('approved'))})
         return {'source': {'id': self.source_id, 'name': self.plan.get('source', ''), 'duration': self.duration,
-                           'proxy_url': url_for(self.root, proxy) if proxy.exists() else None},
+                           'proxy_url': url_for(self.root, proxy) if editor_ops.proxy_ready(self.root, self.source_id) else None,
+                           'missed_speech': gaps.exists()},
                 'profile': self.output.name, 'output': str(self.output),
                 'gallery_url': url_for(self.root, self.output/'index.html', False),
                 'settings': {k: self.config[k] for k in ('width', 'height', 'font', 'font_size', 'subtitle_y', 'highlight',
                                                         'speaker_switch_min_seconds')},
-                'limits': {'max_shift': 30.0, 'context': editor_ops.CONTEXT, 'fps': editor_ops.FPS},
-                'captions_dirty': edits.exists() and edits.stat().st_mtime > clips_mtime,
-                'caption_edits': len(json.loads(edits.read_text(encoding='utf-8-sig'))['edits']) if edits.exists() else 0,
+                'limits': {'context': editor_ops.CONTEXT, 'fps': editor_ops.FPS},
+                'captions_dirty': any(p.exists() and p.stat().st_mtime > clips_mtime for p in (edits, gaps)),
+                'caption_edits': caption_edit_count(edits),
                 'clips': items, 'decisions': self.decisions(), 'job': job.snapshot()}
+
+
+def caption_edit_count(path: Path):
+    if not path.exists():
+        return 0
+    data = json.loads(path.read_text(encoding='utf-8-sig'))
+    return len(data.get('edits', []))+len(data.get('added', []))
+
+
+def needs_prepare(state: State):
+    from missed_speech import load_gaps
+    return (not editor_ops.proxy_ready(state.root, state.source_id)
+            or load_gaps(state.cache, MODEL, editor_ops.task_of(state.source, state.cache, MODEL)) is None)
 
 
 def make_handler(state: State, job: Job):
@@ -203,8 +224,10 @@ def make_handler(state: State, job: Job):
     editor_dir = (root/'editor').resolve()
     fonts_dir = (root/'assets'/'fonts').resolve()
 
-    def start_proxy():
-        job.start('proxy', [sys.executable, str(root/'editor_ops.py'), 'proxy', state.source_id])
+    def start_prepare():
+        def after():
+            state.forget_transcript()
+        job.start('prepare', [sys.executable, str(root/'editor_ops.py'), 'prepare', state.source_id], after=after)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -265,6 +288,13 @@ def make_handler(state: State, job: Job):
                     return self._send(200, state.payload(job))
             if name == 'job':
                 return self._send(200, job.snapshot())
+            if name == 'frames':
+                return self._send(200, state.grid().client())
+            if name == 'retranscribe':
+                path = editor_ops.retranscribe_path(root, state.source_id)
+                if not path.exists():
+                    return self._error(404, 'Nothing has been re-transcribed yet.')
+                return self._send(200, json.loads(path.read_text(encoding='utf-8')))
             segments = name.split('/')
             if len(segments) == 3 and segments[0] == 'clips':
                 clip = state.clip(unquote(segments[1]))
@@ -295,7 +325,7 @@ def make_handler(state: State, job: Job):
             end = min(state.duration, self._number(query, 'end', clip['end']))
             if not end > start:
                 raise ValueError('The caption range is empty.')
-            ctx = editor_ops.CONTEXT
+            ctx = min(600.0, max(editor_ops.CONTEXT, self._number(query, 'context', editor_ops.CONTEXT)))
             low, high = max(0, min(start, clip['start'])-ctx), max(end, clip['end'])+ctx
             words = [w for w in state.words() if w['end'] >= low and w['start'] <= high]
             return self._send(200, {'start': start, 'end': end, 'words': words,
@@ -377,9 +407,9 @@ def make_handler(state: State, job: Job):
             segments = name.split('/')
             if name == 'apply':
                 return self._apply()
-            if name == 'proxy':
-                if not editor_ops.proxy_path(root, state.source_id).exists():
-                    start_proxy()
+            if name in ('proxy', 'prepare'):
+                if needs_prepare(state):
+                    start_prepare()
                 return self._send(200, job.snapshot())
             if name == 'export':
                 folder, files = editor_ops.export_ready(state.output, state.decisions())
@@ -387,11 +417,28 @@ def make_handler(state: State, job: Job):
             if job.busy('apply'):
                 raise RuntimeError('Apply is running; edits are paused until it finishes.')
             if name == 'captions':
-                index, to = body.get('index'), body.get('to')
+                from transcript_edits import FIELDS
+                changes = {k: body[k] for k in FIELDS if k in body}
                 with _LOCK:
-                    editor_ops.save_caption_edit(state.source, state.cache, MODEL, index, to)
+                    editor_ops.save_caption_edit(state.source, state.cache, MODEL, body.get('index'), changes)
                 state.forget_transcript()
-                return self._send(200, {'word': next(w for w in state.words() if w['index'] == index)})
+                return self._send(200, {'ok': True})
+            if name == 'captions/add':
+                with _LOCK:
+                    ids = editor_ops.add_caption_words(state.cache, MODEL, body.get('words'))
+                state.forget_transcript()
+                return self._send(200, {'ids': ids})
+            if name == 'retranscribe':
+                start, end = body.get('start'), body.get('end')
+                if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (start, end)):
+                    raise ValueError('start and end must be numbers.')
+                start, end = max(0.0, float(start)), min(state.duration, float(end))
+                if not 0 < end-start <= 30:
+                    raise ValueError('Re-transcribe between 0 and 30 seconds at a time.')
+                editor_ops.retranscribe_path(root, state.source_id).unlink(missing_ok=True)
+                job.start('transcribe', [sys.executable, str(root/'editor_ops.py'), 'retranscribe', state.source_id,
+                                         f'{start:.3f}', f'{end:.3f}'])
+                return self._send(200, job.snapshot())
             if len(segments) == 3 and segments[0] == 'clips':
                 clip = state.clip(unquote(segments[1]))
                 if clip is None:
@@ -411,6 +458,10 @@ def make_handler(state: State, job: Job):
                 from gallery import validate_overrides
                 check_overrides_against_shots(validate_overrides(overrides), focus['shots'], focus['frame_count'])
             base = body.pop('base', None)
+            for edge, name in (('start', 'start_shift'), ('end', 'end_shift')):
+                value = body.get(name, 0)
+                if isinstance(value, (int, float)) and not -1e-3 <= clip[edge]+value <= state.duration+.05:
+                    raise ValueError(f'The {edge} would move outside the source (0-{state.duration:.2f} s).')
             with _LOCK:
                 decisions = state.decisions()
                 current = decisions['clips'].get(clip_key(clip), {}).get('updated')
@@ -434,18 +485,57 @@ def make_handler(state: State, job: Job):
                       before=before, after=after)
             return self._send(200, job.snapshot())
 
-    return Handler, start_proxy
+    return Handler, start_prepare
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A browser dropping a connection (a closed window, a cancelled video range) is normal.
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def app_browser():
+    """A Chromium browser that can open a page as its own window (Edge or Chrome), or None."""
+    import shutil
+    names = ['msedge', 'chrome', 'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'microsoft-edge']
+    found = next((shutil.which(n) for n in names if shutil.which(n)), None)
+    if found:
+        return found
+    candidates = []
+    if sys.platform == 'win32':
+        for base in (os.environ.get('ProgramFiles(x86)'), os.environ.get('ProgramFiles'), os.environ.get('LocalAppData')):
+            if base:
+                candidates += [Path(base)/'Microsoft/Edge/Application/msedge.exe', Path(base)/'Google/Chrome/Application/chrome.exe']
+    elif sys.platform == 'darwin':
+        candidates += [Path('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'),
+                       Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')]
+    return next((str(p) for p in candidates if p.is_file()), None)
+
+
+def open_app_window(url):
+    """Open the editor as its own window without tabs or address bar (Edge/Chrome app
+    mode); without such a browser, open it in the default browser."""
+    browser = app_browser()
+    if browser:
+        try:
+            subprocess.Popen([browser, f'--app={url}', '--window-size=1600,1000'], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            pass
+    import webbrowser
+    webbrowser.open(url)
 
 
 def serve(root: Path, output: Path, port=8765, open_browser=True):
     """Serve the editor on 127.0.0.1 until interrupted; creates the preview proxy if missing."""
     write_gallery(output, root)
     state, job = State(root, output), Job()
-    handler, start_proxy = make_handler(state, job)
+    handler, start_prepare = make_handler(state, job)
     server = None
     for candidate in range(port, port+20):
         try:
@@ -459,12 +549,11 @@ def serve(root: Path, output: Path, port=8765, open_browser=True):
     print(f'Clip editor: {url}', flush=True)
     print(f'Decisions are saved to: {Path(output)/DECISIONS_FILE}', flush=True)
     print('Press Ctrl+C to stop.', flush=True)
-    if not editor_ops.proxy_path(state.root, state.source_id).exists():
-        print('Creating the preview proxy in the background.', flush=True)
-        start_proxy()
+    if needs_prepare(state):
+        print('Preparing the editor in the background (preview proxy, missed-speech pass).', flush=True)
+        start_prepare()
     if open_browser:
-        import webbrowser
-        webbrowser.open(url)
+        open_app_window(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
