@@ -10,6 +10,7 @@ You drop a video into `Raw/` and tell your AI coding agent (Codex, Claude Code, 
 - **Word-by-word highlighted captions**, transcribed locally with Whisper.
 - **Clean cuts** that never split a word or flash a few frames of the neighbouring camera shot, with loudness normalisation and soft audio fades.
 - **A clip editor in your browser** to approve or reject clips, move edges, fix framing and correct caption words.
+- **Music edits** of the clips you choose: the dialogue up to the payoff line, a drop on your own music, and a black-and-white or warm montage cut on every beat. Each edit comes with and without the music.
 
 ## Requirements
 
@@ -41,6 +42,7 @@ The agent follows [AGENTS.md](AGENTS.md). It prepares transcripts, chooses the c
 ./run.cmd --require-reviewed   # render clips from the agent's reviewed plans
 ./run.cmd --review-gallery     # open the clip editor
 ./run.cmd --apply-review       # apply your editor decisions
+./run.cmd --scan-music         # detect tempo and drop of the tracks in Music/
 ```
 
 A plain `./run.cmd` with no options picks clips with a simple keyword heuristic. It is a rough fallback; the agent does a far better job.
@@ -69,6 +71,7 @@ Output size, caption font, size, position and colour, fades and speaker-switch t
 
 - [docs/framing.md](docs/framing.md): how speaker framing works, and the plan file format
 - [docs/clip-editor.md](docs/clip-editor.md): the editor and the review decisions file
+- [docs/edits.md](docs/edits.md): music edits, the `Music/` sidecars and the edit checks
 - [docs/reference.md](docs/reference.md): all commands, caption corrections, caching and tests
 - [examples/plan.example.json](examples/plan.example.json): an example clip plan
 

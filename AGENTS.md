@@ -55,6 +55,39 @@ Carry the job through to verified MP4 files. A running process is not completion
 
 Details: `docs/framing.md`.
 
+## Music edits
+
+A music edit is the fan-edit version of a clip:
+- the clip's dialogue up to its payoff line;
+- a drop on the music;
+- a 4–9 s montage of the same character, one shot per beat;
+- a black tail.
+
+Make edits when the user asks for them, or when `Music/` holds tracks while you prepare clips. You pick which clips get one.
+
+1. **Tracks.** Run `run --scan-music`. It lists every track with its BPM, beat length, drop and `mood`.
+   - You cannot hear the music. Pick a track by its `mood` and its tempo.
+   - When a track has no mood, ask the user to fill in `mood` in `Music/<name>.json`, then continue.
+   - Never edit a sidecar's `bpm`, `first_beat` or `drop` unless the user asks.
+2. **Clips.** An edit suits a clip that ends on a clear payoff in its last line: a punchline, a comeback, a reveal, a defiant or emotional last word. Its final word must end at least 0.1 s before the clip end. Skip clips whose strongest moment is not at the end; they stay plain clips. Identify who the montage is about separately from who speaks the last word. A reply or reaction can be the reason to feature the other character.
+3. **Write the plan.** Add a top-level `edits` block, keyed by clip id (see `docs/edits.md` for every field):
+   - `track`: matching the clip's tone.
+   - `payoff_word`: the `index` of the payoff's last word in `words.json`.
+   - `dialogue_start`: an edit runs about 20–30 s, so its dialogue lasts about 10–20 s. When the clip is longer, open the edit on the latest line that still sets up the payoff, in a gap between two words.
+   - `effects`: use `"copper"` for new music edits unless the user requests another treatment. Existing plans keep their chosen profile. Copper uses restrained colour, a short music-bed dip before the drop, a four-frame hold at the end of the last shot, and a short black tail.
+   - `transition`: use `"cut"` with Copper. Use a clear, immediately recognisable shot of the character on the first frame of the drop. Set `drop_delay` around 0.19–0.25 s when the end of the line leaves room. Leave `grade` unset for the Copper colour look; override it if the source or the user's requested tone calls for it.
+   - `montage`: pick distinct moments of the featured character from the same source, outside the clip. Verify the actual frames around promising contact-sheet times. Alternate readable close-ups, medium shots and meaningful motion. Aim for about 5–7 s of montage when the track and available shots support it. The last shot may hold `"slots": 2`. Each entry starts with `{"start": <source seconds>}`.
+   - **Copper shot directions.** Use the default eye-anchored push on the first shot when its framing has room. Use `"motion": "none"` if the first shot is already tight or the face is unsuitable for tracking. `center_x` sets the horizontal crop in source coordinates; `anchor: [x, y]` sets a manual push pivot in the cropped frame. Check that the face stays readable. Add `"motion": "ramp"` to one shot with a visible gesture or expression, and check that the action lands in the slower part. Adjust its source start if needed. Leave other shots on clean cuts unless a second push is motivated by the action. Use `"flash": "white"` on at most three separated accents after the drop. Use `practical_light: [x, y]` only where a real bright source is visible, and `"cool_background": true` only on shots whose vivid violet or blue distracts from the face. Choose a final pose that reads clearly during the short hold. Skip silhouette echoes and routine shake in this treatment.
+   - `reason`.
+4. **Check.** Run `run --require-reviewed --analyze-only`. It lists every problem with the edits; a shot that crosses a camera cut comes with the times to move it to. A speed ramp can need more source footage than its beat slot. It also writes `Review/<id>/edits/<stem>-montage.jpg`. Review Copper's entry, motion and exit frames. Fix misplaced crops with `center_x` and adjust the push anchor or shot timing where needed.
+5. **Render.** `run --require-reviewed` renders the edits after the clips into `<profile>/edits/`. A failed acceptance check fails the run: cuts on the beat grid, the drop's loudness jump, the drop delay or the frame count. Fix the cause. Look at `work/<id>/qa-current/edits/edit-<clip id>.jpg`.
+6. **Deliver.** Per edit, give the user:
+   - both files, `<stem>.edit.mp4` (with music) and `<stem>.edit-nomusic.mp4`;
+   - the duration and the track;
+   - the `music_hint` from `<stem>.edit.json`, which says where to start the track in an app.
+
+Edit defaults live in `edit_settings.json`. Treat them like `video_settings.json`: change them only when the user asks.
+
 ## Applying the user's review
 
 The user reviews clips in the clip editor (`run --review-gallery`), which saves `review-decisions.json` in the output profile folder, keyed by clip id.
@@ -63,6 +96,7 @@ The user reviews clips in the clip editor (`run --review-gallery`), which saves 
 2. For each open entry (`needs_changes` or `rejected` with `addressed` not true): follow the comment and every timeline note (`notes`: `{"t": <source seconds>, "text": "..."}`, pinned to the moment it is about), fix framing through `focus_overrides`, re-cut on word boundaries if the comment or a note asks for more than the moved edges, and re-render.
 3. Set that entry's `addressed: true`, `addressed_at` and a short `agent_note` in the decisions file.
 4. Leave approved (locked) clips alone unless the user withdraws the approval. Then give the user the review link again.
+5. Music edits have their own decisions (`edits` in the decisions file; the editor's *Edit* tab). Apply locks approved edits and removes rejected ones without touching their clips. For each open edit, listed as `[<id> edit]`, follow the comment and re-render: another track, other montage shots, another grade or transition. Then mark it addressed the same way.
 
 Details: `docs/clip-editor.md`.
 

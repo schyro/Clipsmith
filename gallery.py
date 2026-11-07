@@ -37,7 +37,7 @@ def now_iso():
 def empty_decisions(plan=None, profile=''):
     plan = plan or {}
     return {'version': 1, 'source': plan.get('source', ''), 'source_id': plan.get('source_id', ''),
-            'profile': profile, 'clips': {}}
+            'profile': profile, 'clips': {}, 'edits': {}}
 
 
 def clip_key(clip):
@@ -55,6 +55,8 @@ def load_decisions(folder: Path):
     data = json.loads(path.read_text(encoding='utf-8-sig'))
     # Older files were keyed by file name ("01_Title.mp4"); move them to ids.
     data['clips'] = {clip_key({'file': k}) if k.endswith('.mp4') else k: v for k, v in data.get('clips', {}).items()}
+    # Music edits have their own decisions, keyed by the id of the clip they belong to.
+    data.setdefault('edits', {})
     return data
 
 
@@ -181,14 +183,43 @@ def apply_decision(decisions, clip, update, timestamp=None):
     return entry
 
 
+def validate_edit_update(update):
+    """A music edit is only watched and decided: a status and a comment."""
+    if not isinstance(update, dict):
+        raise ValueError('Decision must be an object.')
+    status = update.get('status', 'pending')
+    if status not in STATUSES:
+        raise ValueError(f'Unknown status: {status!r}')
+    comment = update.get('comment', '')
+    if not isinstance(comment, str) or len(comment) > MAX_COMMENT:
+        raise ValueError(f'Comment must be text of at most {MAX_COMMENT} characters.')
+    return {'status': status, 'comment': comment.strip()}
+
+
+def apply_edit_decision(decisions, clip, update, timestamp=None):
+    """Merge a user decision on a clip's music edit; a change reopens it for the agent."""
+    clean = validate_edit_update(update)
+    key = clip_key(clip)
+    edits = decisions.setdefault('edits', {})
+    entry = dict(edits.get(key, {}))
+    if not entry or any(entry.get(k) != v for k, v in clean.items()):
+        entry.update(clean)
+        entry.update({'title': clip.get('title', ''), 'updated': timestamp or now_iso(), 'addressed': False})
+        entry.pop('addressed_at', None)
+        entry.pop('agent_note', None)
+    edits[key] = entry
+    return entry
+
+
 def note_time(seconds):
     m, s = divmod(max(0.0, seconds), 60)
     return f'{int(m)}:{s:05.2f}'
 
 
-def actionable(decisions):
-    """Decisions the agent still has to act on: needs_changes or rejected, not yet addressed."""
-    return {name: d for name, d in (decisions or {}).get('clips', {}).items()
+def actionable(decisions, kind='clips'):
+    """Decisions the agent still has to act on: needs_changes or rejected, not yet addressed.
+    `kind` is 'clips' or 'edits' (music edits)."""
+    return {name: d for name, d in (decisions or {}).get(kind, {}).items()
             if d.get('status') in ('needs_changes', 'rejected') and not d.get('addressed')}
 
 

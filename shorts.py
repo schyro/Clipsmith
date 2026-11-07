@@ -520,8 +520,8 @@ def render_plan(source, plan, cache, config, force, model='medium', plan_path=No
     write_json(output/'clips.json',index)
     from gallery import write_gallery
     write_gallery(output,ROOT,index,plan)
-    print(f'Completed: {output}',flush=True)
     write_json(cache/'last-render.json',{'profile':config['profile'],'output':str(output),'clips':len(index)})
+    print(f'Completed: {output}',flush=True)
     return output
 
 
@@ -546,16 +546,21 @@ def main():
     parser.add_argument('--review-gallery', nargs='?', const='', metavar='OUTPUT', help='Open the clip editor for an output folder and record decisions (default: latest output folder)')
     parser.add_argument('--write-gallery', nargs='?', const='', metavar='OUTPUT', help='Regenerate only index.html for an output folder (default: latest)')
     parser.add_argument('--apply-review', nargs='?', const='', metavar='OUTPUT', help='Apply gallery decisions to the plan and re-render changed clips (default: latest output folder)')
+    parser.add_argument('--scan-music', action='store_true', help='Detect tempo, beat grid and drop of new tracks in Music/ and list all tracks')
     parser.add_argument('--port', type=int, default=8765, help='Clip editor port')
     parser.add_argument('--no-open', action='store_true', help='Do not open a browser for --review-gallery')
     args = parser.parse_args()
     migrate_all()
+    if args.scan_music:
+        import music
+        music.main()
+        return 0
     if args.apply_review is not None:
         from gallery import latest_output
         from review_apply import apply_review
         output = Path(args.apply_review).resolve() if args.apply_review else latest_output(ROOT)
-        apply_review(output, ROOT, settings(), args.force, args.model)
-        return 0
+        _, _, edit_error = apply_review(output, ROOT, settings(), args.force, args.model)
+        return 1 if edit_error else 0
     if args.review_gallery is not None or args.write_gallery is not None:
         from gallery import latest_output, write_gallery
         target = args.review_gallery if args.review_gallery is not None else args.write_gallery
@@ -614,12 +619,25 @@ def main():
                 from selection import check_reviewed_plan
                 check_reviewed_plan(plan,duration,english_transcript(source,cache,args.model))
             if args.analyze_only:
+                if plan.get('edits'):
+                    # Montage framing and camera cuts need the speaker analysis; show the sheets to review.
+                    from edits import preview_edits
+                    sheets, problems = preview_edits(source,plan,cache,config,english_transcript(source,cache,args.model))
+                    print('Montage sheets (graded and framed as rendered):',flush=True)
+                    for sheet in sheets:
+                        print(f'    {sheet}',flush=True)
+                    if problems:
+                        lines = ''.join(f'\n  - {p}' for p in problems)
+                        raise ValueError(f'The edits are not ready to render:{lines}')
                 print(f'Plan ready: {plan_path}',flush=True)
                 continue
             output = render_plan(source,plan,cache,config,args.force,args.model,plan_path)
             if args.require_reviewed:
                 from verify_outputs import verify_folder
                 verify_folder(output,config)
+            # Music edits build on the finished, validated clips; a failed edit fails the run.
+            from edits import render_edits
+            render_edits(source,plan,cache,config,output,english_transcript(source,cache,args.model),args.force)
         except Exception as exc:
             print(f'ERROR — {source.name}: {exc}',file=sys.stderr,flush=True)
             failures.append(source)

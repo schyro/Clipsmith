@@ -13,6 +13,7 @@ editorial agent.
 from __future__ import annotations
 import json
 from pathlib import Path
+import sys
 
 FPS = 30
 START_PAD = .15   # seconds kept before the first word
@@ -172,6 +173,41 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, gri
     return notes, done
 
 
+def apply_edits_to_plan(plan, decisions, timestamp):
+    """Lock approved music edits, withdraw approvals, and move rejected edits (and edits
+    of clips that left the plan) to `rejected_edits`. The clip itself is never touched.
+    Returns {clip id: note}."""
+    notes = {}
+    edits = plan.get('edits') or {}
+    entries = decisions.get('edits', {})
+    ids = {c['id'] for c in plan['clips']}
+    for key in list(edits):
+        edit = edits[key]
+        entry = entries.get(key) or {}
+        status = entry.get('status', 'pending')
+        if key not in ids:
+            plan.setdefault('rejected_edits', {})[key] = {**edit, 'rejected_at': timestamp,
+                                                         'review_comment': 'The clip left the plan.'}
+            del edits[key]
+            notes[key] = 'Edit removed with its clip; files moved to edits/rejected/.'
+            continue
+        if status == 'rejected' and not entry.get('addressed'):
+            plan.setdefault('rejected_edits', {})[key] = {**edit, 'rejected_at': timestamp,
+                                                         'review_comment': entry.get('comment', '')}
+            del edits[key]
+            notes[key] = 'Edit removed from the plan; files moved to edits/rejected/. The clip stays.'
+            continue
+        if status == 'approved':
+            if not edit.get('approved'):
+                edit['approved'] = {'at': entry.get('updated', timestamp)}
+                notes[key] = 'Edit approved; locked against re-rendering.'
+        elif edit.pop('approved', None):
+            notes[key] = 'Edit approval withdrawn; it renders normally again.'
+    if 'edits' in plan and not plan['edits']:
+        del plan['edits']
+    return notes
+
+
 def closes(entry, done_options):
     """An applied entry is addressed when it was rejected, or when every requested
     option was handled and no comment or note still needs the agent."""
@@ -203,6 +239,7 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
     before = {c['id']: c for c in plan['clips']}
     handled = {}
     notes, done = apply_to_plan(plan, decisions, words, duration, timestamp, handled, grid)
+    edit_notes = apply_edits_to_plan(plan, decisions, timestamp)
     validate_plan(plan, source_id, duration)
     write_json(plan_path, plan)
     # Archive rejected clips explicitly, before render_plan tidies the folder.
@@ -229,15 +266,38 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
                               'file': clip_stem(current[key])+'.mp4'})
             if closes(entry, handled.get(key, set())):
                 entry.update({'addressed': True, 'addressed_at': timestamp})
+    for key, note in edit_notes.items():
+        entry = decisions.setdefault('edits', {}).get(key)
+        if entry is None:
+            continue
+        entry['agent_note'] = note
+        if entry.get('status') == 'rejected':
+            entry.update({'addressed': True, 'addressed_at': timestamp})
     decisions['profile'] = target.name
     save_decisions(target, decisions)
     if target != output:
         save_decisions(output, decisions)
     write_gallery(target, root)
+    # Music edits render only after the decisions are saved: a failed edit must never leave
+    # applied edge shifts in the decisions file, where the next Apply would apply them again.
+    from edits import render_edits
+    edit_error = None
+    try:
+        render_edits(source, plan, cache, config, target, transcript, force)
+    except ValueError as exc:
+        edit_error = str(exc)
     remaining = actionable(decisions)
-    print(f'Applied {len(notes)} decision(s).', flush=True)
+    print(f'Applied {len(notes)+len(edit_notes)} decision(s).', flush=True)
     for key, note in sorted(notes.items()):
         print(f'  [{key}] {note}', flush=True)
+    for key, note in sorted(edit_notes.items()):
+        print(f'  [{key} edit] {note}', flush=True)
+    open_edits = actionable(decisions, 'edits')
+    if open_edits:
+        print(f'Open music edits ({len(open_edits)}):', flush=True)
+        for key, entry in sorted(open_edits.items()):
+            print(f'  [{key} edit] {entry.get("title", "")}: {entry["status"]}; comment: {entry.get("comment") or "-"}',
+                  flush=True)
     if remaining:
         print(f'Open for the editor ({len(remaining)}):', flush=True)
         for key, entry in sorted(remaining.items()):
@@ -246,7 +306,9 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
             start = entry.get('start') or 0
             for note in entry.get('notes') or []:
                 print(f'      note at {note_time(note["t"]-start)} (source {note["t"]:.2f} s): {note["text"]}', flush=True)
-    return target, remaining
+    if edit_error:
+        print(f'ERROR — {edit_error}', file=sys.stderr, flush=True)
+    return target, remaining, edit_error
 
 
 HISTORY = 'history'

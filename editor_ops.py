@@ -350,7 +350,7 @@ def preview_render(root: Path, output: Path, clip_id):
 
 
 def export_ready(output: Path, decisions):
-    """Copy approved clips (video and captions) into <output>/ready. Files there
+    """Copy approved clips (video and captions) and approved music edits into <output>/ready. Files there
     that are no longer approved are removed; nothing is published anywhere."""
     output = Path(output)
     approved = {k for k, d in (decisions or {}).get('clips', {}).items() if d.get('status') == 'approved'}
@@ -362,6 +362,20 @@ def export_ready(output: Path, decisions):
         stem = Path(clip['file']).stem
         for name in (clip['file'], stem+'.en.srt'):
             src = output/name
+            if src.exists():
+                dst = folder/name
+                if not dst.exists() or dst.stat().st_size != src.stat().st_size or dst.stat().st_mtime < src.stat().st_mtime:
+                    shutil.copy2(src, dst)
+                keep.add(name)
+    # Approved music edits: both the music and the no-music file.
+    edits_dir = output/'edits'
+    approved_edits = {k for k, d in (decisions or {}).get('edits', {}).items() if d.get('status') == 'approved'}
+    index = edits_dir/'edits.json'
+    for info in json.loads(index.read_text(encoding='utf-8')) if index.exists() else []:
+        if info['id'] not in approved_edits:
+            continue
+        for name in (info['file'], info['nomusic_file']):
+            src = edits_dir/name
             if src.exists():
                 dst = folder/name
                 if not dst.exists() or dst.stat().st_size != src.stat().st_size or dst.stat().st_mtime < src.stat().st_mtime:

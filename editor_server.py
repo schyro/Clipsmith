@@ -19,7 +19,8 @@ import time
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import editor_ops
-from gallery import (DECISIONS_FILE, _LOCK, _resolve_inside, apply_decision, check_overrides_against_shots,
+from gallery import (DECISIONS_FILE, _LOCK, _resolve_inside, apply_decision, apply_edit_decision,
+                     check_overrides_against_shots,
                      clip_key, empty_decisions, load_decisions, parse_range, save_decisions, write_gallery)
 
 MODEL = 'medium'
@@ -179,6 +180,10 @@ class State:
         clips_mtime = (self.output/'clips.json').stat().st_mtime
         previews = editor_ops.preview_dir(self.root, self.source_id)
         proxy = editor_ops.proxy_path(self.root, self.source_id)
+        edits_dir = self.output/'edits'
+        index = edits_dir/'edits.json'
+        edit_infos = {e['id']: e for e in json.loads(index.read_text(encoding='utf-8'))} if index.exists() else {}
+        plan_edits = self.plan.get('edits') or {}
         items = []
         for clip in self.clips:
             key = clip_key(clip)
@@ -192,7 +197,8 @@ class State:
                           'history_url': url_for(self.root, history) if history else None,
                           'preview_url': url_for(self.root, preview) if preview.exists() else None,
                           'preview': json.loads(meta.read_text(encoding='utf-8')) if meta.exists() else None,
-                          'locked': bool(clip.get('approved'))})
+                          'locked': bool(clip.get('approved')),
+                          'edit': edit_item(self.root, edit_infos.get(key), plan_edits.get(key), edits_dir)})
         return {'source': {'id': self.source_id, 'name': self.plan.get('source', ''), 'duration': self.duration,
                            'proxy_url': url_for(self.root, proxy) if editor_ops.proxy_ready(self.root, self.source_id) else None,
                            'missed_speech': gaps.exists()},
@@ -204,6 +210,20 @@ class State:
                 'captions_dirty': any(p.exists() and p.stat().st_mtime > clips_mtime for p in (edits, gaps)),
                 'caption_edits': caption_edit_count(edits),
                 'clips': items, 'decisions': self.decisions(), 'job': job.snapshot()}
+
+
+def edit_item(root, info, planned, folder):
+    """What the editor shows for a clip's music edit: its two files, the music and the checks."""
+    if not info:
+        return None
+    return {**{k: info.get(k) for k in ('track', 'mood', 'bpm', 'grade', 'transition', 'effects', 'duration', 'payoff_text',
+                                         'music_hint', 'checks', 'track_drop')},
+            'drop_at': info['timeline']['drop_at'], 'interval': info['timeline']['interval'],
+            'shots': len(info['timeline']['shot_frames']),
+            'reason': (planned or {}).get('reason', ''), 'locked': bool((planned or {}).get('approved')),
+            'video_url': url_for(root, folder/info['file']),
+            'nomusic_url': url_for(root, folder/info['nomusic_file']),
+            'poster_url': url_for(root, folder/info['cover'])}
 
 
 def caption_edit_count(path: Path):
@@ -455,6 +475,8 @@ def make_handler(state: State, job: Job):
                     return self._error(404, 'Unknown clip')
                 if segments[2] == 'decision':
                     return self._decision(clip, body)
+                if segments[2] == 'edit-decision':
+                    return self._edit_decision(clip, body)
                 if segments[2] == 'preview':
                     key = clip_key(clip)
                     job.start('preview', [sys.executable, str(root/'editor_ops.py'), 'preview', str(state.output), key], clip=key)
@@ -479,6 +501,18 @@ def make_handler(state: State, job: Job):
                 if base != current:
                     raise RuntimeError('This clip was changed elsewhere; the editor reloads it.')
                 entry = apply_decision(decisions, clip, body)
+                save_decisions(state.output, decisions)
+            return self._send(200, entry)
+
+        def _edit_decision(self, clip, body):
+            base = body.pop('base', None)
+            with _LOCK:
+                decisions = state.decisions()
+                current = decisions.get('edits', {}).get(clip_key(clip), {}).get('updated')
+                # Like clip decisions: a stale window cannot overwrite a newer decision.
+                if base != current:
+                    raise RuntimeError('This edit was changed elsewhere; the editor reloads it.')
+                entry = apply_edit_decision(decisions, clip, body)
                 save_decisions(state.output, decisions)
             return self._send(200, entry)
 

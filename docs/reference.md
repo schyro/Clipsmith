@@ -31,12 +31,17 @@ Settings live in `video_settings.json`. Revised exports use `Output/<source>_<id
 # Use a smaller transcription model.
 ./run.cmd --model small
 
+# Detect tempo, beat grid and drop of new tracks in Music/ and list every track.
+./run.cmd --scan-music
+
 # Use a specific plan or force re-encoding of the current output profile.
 ./run.cmd --input "Raw/recording.mp4" --plan "Plans/source_id.json"
 ./run.cmd --force
 ```
 
 `--require-reviewed` checks a reviewed plan before it renders anything and lists every problem at once: no clip edge may fall inside a spoken word, and an agent-reviewed plan needs a `coverage` note for every dialogue block of `review.md`, with `why_not_more` for empty blocks and, when there are fewer clips than one per two minutes, for single-clip blocks (AGENTS.md, step 3). Add `--analyze-only` to run only this check. After rendering, it runs `verify_outputs.py` on the output folder and prints the QA sheets and the focus sheets with flagged shots. The editor's Apply skips these agent checks.
+
+A plan with an `edits` block also gets its music edits checked here, and rendered after the clips into `<profile>/edits/` ([docs/edits.md](edits.md)). With `--analyze-only` this includes the montage shots' camera cuts and the montage sheets.
 
 A plain run uses keyword/question/speech-density proposals for new sources. This is not equivalent to the model reviewing the full content. Existing plans take precedence on subsequent runs.
 

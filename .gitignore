@@ -8,5 +8,7 @@ __pycache__/
 
 # Personal data: your own plans and session notes stay local.
 Plans/*.json
+# Music tracks and their sidecars stay local (licensing).
+Music/
 .claude/settings.local.json
 .claude/launch.json

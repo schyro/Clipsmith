@@ -163,6 +163,7 @@ const ICONS = {
   captions: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 12h4M13 12h4M7 15.5h7"/>',
   review: '<path d="M4 5h16v11H9l-5 4z"/>',
   film: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+  music: '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
   text: '<path d="M4 6h16M4 10h16M4 14h10M4 18h12"/>',
   keyboard: '<rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.5M9.5 10h.5M13 10h.5M16.5 10h.5M7 14h10"/>',
   export: '<path d="M12 15V4M8 8l4-4 4 4"/><path d="M5 13v6h14v-6"/>',
@@ -612,6 +613,87 @@ function ReviewPanel({ ctx, clip, entry, locked, applying, jobRunning, job, t, o
     </${Card}>`;
 }
 
+// ---------- music edit: watch both versions and decide ----------
+
+const EDIT_CHECKS = { frames: 'Frame count', cuts: 'Cuts on the beat grid', drop_gain_db: 'Drop loudness jump',
+                      bed_db: 'Music under the dialogue', drop_delay: 'Drop after the payoff' };
+
+const num = (v, digits = 2) => (v == null || !isFinite(v) ? '–' : Number(v).toFixed(digits));
+const plusDb = (v) => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(1)} dB`;
+
+function checkText(k, c) {
+  if (k === 'frames') return `${c.found} of ${c.expected}`;
+  if (k === 'cuts') return `${c.exact} of ${c.seen} on their frame (${c.of} cuts${c.unclear.length ? `, ${c.unclear.length} between similar shots` : ''})`;
+  if (k === 'drop_gain_db') return `${plusDb(c.gain)} (at least ${plusDb(c.min)})`;
+  if (k === 'drop_delay') return `${num(c.seconds)} s`;
+  if (k === 'bed_db') return c.level == null ? c.note : `${num(-c.level, 1)} dB under the dialogue`;
+  return '';
+}
+
+function EditPanel({ clip, decision, applying, onSaved, notify }) {
+  const e = clip.edit;
+  const [music, setMusic] = useState(true);
+  const [entry, setEntry] = useState(decision || { status: 'pending', comment: '' });
+  const base = useRef(decision ? decision.updated ?? null : null);
+  const queue = useRef(Promise.resolve());
+  const timer = useRef();
+  useEffect(() => {
+    setEntry(decision || { status: 'pending', comment: '' });
+    base.current = decision ? decision.updated ?? null : null;
+  }, [clip.key]);
+  // Saves run one after another and name the version they were based on.
+  const send = (next) => {
+    queue.current = queue.current.then(async () => {
+      try {
+        const saved = await request(`clips/${encodeURIComponent(clip.key)}/edit-decision`,
+          { status: next.status, comment: next.comment || '', base: base.current });
+        base.current = saved.updated ?? null;
+        onSaved(clip.key, saved);
+      } catch (err) { notify('Not saved: ' + err.message, 'bad'); }
+    });
+  };
+  const setStatus = (s) => { const next = { ...entry, status: entry.status === s ? 'pending' : s }; setEntry(next); send(next); };
+  const setComment = (v) => {
+    const next = { ...entry, comment: v };
+    setEntry(next);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => send(next), 600);
+  };
+  const checks = Object.entries(e.checks || {});
+  return html`
+    <${Card}>
+      <div class="clipttl"><span class="id">${clip.key}</span><h2>Music edit</h2><span class="d">${num(e.duration, 1)} s</span></div>
+      <div class="editvid"><video key=${music ? 'm' : 'd'} src=${music ? e.video_url : e.nomusic_url} poster=${e.poster_url} preload="metadata" playsinline controls></video></div>
+      <div class="seg wide">${[[true, 'With music'], [false, 'Without music']].map(([v, label]) => html`
+        <button class=${music === v ? 'on' : ''} onClick=${() => setMusic(v)}>${label}</button>`)}</div>
+      ${e.reason && html`<p class="note">${e.reason}</p>`}
+      <div class="decide">${[['approved', 'Approve', 'check'], ['needs_changes', 'Needs changes', 'review'], ['rejected', 'Reject', 'x']].map(([v, label, icon]) => html`
+        <button data-v=${v} class=${entry.status === v ? 'on' : ''} disabled=${applying} onClick=${() => setStatus(v)} title=${STATUS_LABELS[v]}>
+          <${Icon} n=${icon} />${label}</button>`)}</div>
+      ${e.locked && html`<div class="infoline"><${Icon} n="lock" /><span>Approved edits are kept. Select Approve again to withdraw the approval.</span></div>`}
+      ${entry.addressed && html`<div class="infoline ok"><${Icon} n="check" /><span>Addressed${entry.agent_note ? ': ' + entry.agent_note : ''}</span></div>`}
+      <p class="note">Rejecting the edit keeps the clip; Apply moves only the edit's files to edits/rejected/.</p>
+    </${Card}>
+    <${Card} title="Comment for the agent" icon="review">
+      <textarea class="field" placeholder="Another track, other montage shots, a different grade… (optional)" value=${entry.comment || ''}
+        disabled=${applying} onInput=${ev => setComment(ev.target.value)}></textarea>
+    </${Card}>
+    <${Card} title="Music" icon="music">
+      <dl class="kv">
+        <dt>Track</dt><dd>${e.track}</dd>
+        <dt>Mood</dt><dd>${e.mood || '—'}</dd>
+        <dt>Tempo</dt><dd>${num(e.bpm, 1)} BPM, a cut every ${num(e.interval, 3)} s, ${e.shots} shots</dd>
+        <dt>Drop</dt><dd>${num(e.drop_at)} s into the edit, after “${e.payoff_text}”</dd>
+        <dt>Look</dt><dd>${e.grade} · ${e.transition.replace('_', ' ')} · ${e.effects || 'soft'} effects</dd>
+      </dl>
+      <p class="note">${e.music_hint}</p>
+    </${Card}>
+    <${Card} title="Checks" icon="flag">
+      <div>${checks.map(([k, c]) => html`<div class="issue check"><${Icon} n=${c.passed ? 'check' : 'alert'} cls=${c.passed ? '' : 'w'} />
+        <span class="txt"><b>${EDIT_CHECKS[k] || k}</b> · ${checkText(k, c)}</span></div>`)}</div>
+    </${Card}>`;
+}
+
 function CutPanel({ ctx, t, doShift, disabled, locked }) {
   const { clip, entry, snapped } = ctx;
   const row = (edge, label, key) => {
@@ -844,6 +926,7 @@ function App() {
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
   const [entries, setEntries] = useState({});
+  const [editDecisions, setEditDecisions] = useState({});
   const [focusCache, setFocusCache] = useState({});
   const [captions, setCaptions] = useState(null);
   const [snapped, setSnapped] = useState(null);
@@ -906,6 +989,7 @@ function App() {
       entriesRef.current = clips;
       confirmed.current = Object.fromEntries(Object.entries(clips).map(([k, e]) => [k, e.updated ?? null]));
       setEntries(clips);
+      setEditDecisions(d.decisions.edits || {});
       setJob(d.job);
       setFocusCache({});
       setSelected(s => (s && d.clips.some(c => c.key === s)) ? s : (d.clips[0] && d.clips[0].key));
@@ -1561,7 +1645,10 @@ function App() {
     return null;
   };
   let inspector;
-  if (tab === 'review') {
+  if (tab === 'edit' && clip.edit) {
+    inspector = html`<${EditPanel} clip=${clip} decision=${editDecisions[clip.key]} applying=${applying} notify=${notify}
+      onSaved=${(key, saved) => setEditDecisions(m => ({ ...m, [key]: saved }))} />`;
+  } else if (tab === 'review' || tab === 'edit') {
     inspector = html`<${ReviewPanel} ctx=${ctx} clip=${clip} entry=${entry} locked=${locked} applying=${applying} jobRunning=${jobRunning} job=${job} t=${t}
       onStatus=${setStatus} onApproveNext=${approveNext} onComment=${v => edit({ comment: v }, false)} notes=${notes} noteDraft=${noteDraft && noteDraft.key === clip.key ? noteDraft : null}
       onDraftNote=${draftNote} onSaveDraft=${saveDraftNote} onEditNote=${editNote} onDeleteNote=${deleteNote}
@@ -1643,6 +1730,7 @@ function App() {
             <div style=${{ minWidth: 0 }}><div class="title"><span class="num">${c.key}</span>${c.title}</div>
               <div class="meta"><span class="badge st-${e.status}">${STATUS_LABELS[e.status]}</span><span class="mono">${(c.end - c.start).toFixed(1)} s</span>
                 ${c.locked && html`<span class="mk-locked" title="Locked: the approved file is kept"><${Icon} n="lock" /></span>`}
+                ${c.edit && html`<span class=${`mk-edit st-${(editDecisions[c.key] || {}).status || 'pending'}`} title=${`Music edit: ${STATUS_LABELS[(editDecisions[c.key] || {}).status || 'pending']}`}><${Icon} n="music" /></span>`}
                 ${staged && html`<span class="mk-staged" title="Staged cut or framing edits">●</span>`}
                 ${(e.notes || []).length > 0 && html`<span class="muted" title=${`${e.notes.length} note(s) for the agent`}><${Icon} n="pin" /></span>`}
                 ${e.addressed && html`<span class="mk-addr" title="Addressed by the agent"><${Icon} n="check" /></span>`}</div></div></li>`;
@@ -1682,7 +1770,8 @@ function App() {
     </main>
 
     <aside class="panel insp">
-      <div class="ptabs">${[['review', 'Review', 'review'], ['cut', 'Cut', 'cut'], ['framing', 'Framing', 'crop'], ['captions', 'Captions', 'captions']].map(([k, label, icon]) => html`
+      <div class="ptabs">${[['review', 'Review', 'review'], ['cut', 'Cut', 'cut'], ['framing', 'Framing', 'crop'], ['captions', 'Captions', 'captions'],
+                            ...(clip.edit ? [['edit', 'Edit', 'music']] : [])].map(([k, label, icon]) => html`
         <button class="ptab ${tab === k ? 'on' : ''}" onClick=${() => setTab(k)}><${Icon} n=${icon} />${label}${tabDot(k)}</button>`)}</div>
       <div class="ibody">${inspector}</div>
     </aside>

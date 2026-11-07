@@ -117,8 +117,10 @@ def edge_problems(plan, transcript):
 
 def check_reviewed_plan(plan, duration, transcript):
     """Raise ValueError listing every problem of a reviewed plan before rendering."""
+    from edits import edit_problems
     problems = edge_problems(plan, transcript)
     if plan.get('selection') == 'agent-reviewed':
         problems = coverage_problems(plan, duration, transcript)+problems
+    problems += edit_problems(plan, duration, transcript)
     if problems:
         raise ValueError('The plan is not ready to render:\n'+'\n'.join(f'  - {p}' for p in problems))
