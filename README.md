@@ -1,8 +1,8 @@
-# Clipsmith
+![The Clipsmith banner](docs/images/ClipsmithBanner.png)
 
-Turn long recordings into short, captioned vertical clips for Shorts, Reels and TikTok, with an AI agent as your editor.
+Turn long recordings into short, captioned vertical clips for Shorts, Reels and TikTok with an AI agent as your editor.
 
-You drop a video into `Raw/` and tell your AI coding agent (Codex, Claude Code, Cursor, Gemini CLI, Copilot, ...) that you added it. The agent reads the full transcript and picks every moment with short-form potential (funny, surprising, tense, emotional or quotable) as a 20–60 second candidate, and you keep the ones you like. Clipsmith then cuts and frames those clips and burns in the captions. Everything runs on your own computer. No API key is needed.
+Simply drop your video into `Raw/`. Clipsmith finds the best 20–60 second moments, cuts them, optimizes framing and adds captions. Everything runs locally on your computer. No API key required.
 
 ## What you get
 
