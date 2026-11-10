@@ -11,10 +11,11 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import traceback
 from captions import write_captions
 
 ROOT = Path(__file__).resolve().parent
-VERSION = 5
+VERSION = 6
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.m4v', '.webm'}
 LONG_CLIP_SECONDS = 90  # editorial guideline for short-form clips; 180 s is the hard limit
 
@@ -382,10 +383,10 @@ def clip_stem(clip):
 NON_RENDER_KEYS = {'id','title','reason','approved','cover_time'}
 
 
-def render_signature(clip, config, framing, captions):
+def render_signature(clip, config, framing, captions, loudness=None):
     framing = {k: v for k, v in framing.items() if k != 'commands_path'}
     return hashlib.sha256(json.dumps({'clip':{k: v for k, v in clip.items() if k not in NON_RENDER_KEYS},
-                                      'version':VERSION,'settings':config,'reframe':framing,'captions':captions,
+                                      'version':VERSION,'settings':config,'loudness':loudness,'reframe':framing,'captions':captions,
                                       'font':hashlib.sha256((ROOT/'assets/fonts/Dosis-Bold.ttf').read_bytes()).hexdigest()},
                                      sort_keys=True).encode()).hexdigest()
 
@@ -409,7 +410,11 @@ def render(source, clip, dest, cache, force, transcript=None, config=None):
     from focus_review import write_focus_sheet
     framing = focus_plan(source,clip,cache,config,transcript)
     write_json(dest.with_suffix('.focus.json'),framing)
-    digest = render_signature(clip, config, framing, ass.read_text(encoding='utf-8-sig'))
+    from media_filters import audio_filters, measure_loudness, video_filters
+    duration = clip['end']-clip['start']
+    # First loudnorm pass; the measurement is part of the signature because it sets the clip's gain.
+    loudness = measure_loudness(source, clip['start'], duration)
+    digest = render_signature(clip, config, framing, ass.read_text(encoding='utf-8-sig'), loudness)
     marker = dest.with_suffix('.done.json')
     sheet = ROOT/'Review'/cache.name/'focus'/(dest.stem+'.jpg')
     if not force and dest.exists() and marker.exists() and json.loads(marker.read_text())['signature']==digest:
@@ -420,12 +425,10 @@ def render(source, clip, dest, cache, force, transcript=None, config=None):
         return
     write_focus_sheet(source,clip,framing,sheet,config['width'])
     temp = dest.with_name(dest.stem+'.partial.mp4')
-    duration = clip['end']-clip['start']
-    from media_filters import audio_filters,video_filters
     graph = video_filters(framing,clip,config,ass,ROOT/'assets/fonts')
     command = ['ffmpeg','-hide_banner','-loglevel','error','-y','-ss',clip['start'],'-i',source,
                '-t',duration,'-filter_complex',graph,
-               '-map','[v]','-map','0:a:0','-af',audio_filters(duration,config),
+               '-map','[v]','-map','0:a:0','-af',audio_filters(duration,config,loudness),
                '-c:a','aac','-b:a','192k','-ar','48000','-pix_fmt','yuv420p',
                '-movflags','+faststart','-map_metadata','-1']
     if nvenc_available():
@@ -540,6 +543,7 @@ def main():
     parser.add_argument('--model', default='medium', choices=['tiny','base','small','medium','large-v3'])
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--analyze-only', action='store_true')
+    parser.add_argument('--debug', action='store_true', help='Print the full traceback when a source fails')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--prepare-review', action='store_true', help='Prepare the full transcript and timestamped frames for editorial review')
     parser.add_argument('--require-reviewed', action='store_true', help='Require an editorially reviewed plan before rendering')
@@ -617,7 +621,9 @@ def main():
             if args.require_reviewed:
                 # Coverage, clip count and word-safe edges; nothing renders until all pass.
                 from selection import check_reviewed_plan
-                check_reviewed_plan(plan,duration,english_transcript(source,cache,args.model))
+                # Edit problems never stop the clips; they are reported and fail the run after the clips.
+                check_reviewed_plan(plan,duration,english_transcript(source,cache,args.model),
+                                    include_edits=args.analyze_only)
             if args.analyze_only:
                 if plan.get('edits'):
                     # Montage framing and camera cuts need the speaker analysis; show the sheets to review.
@@ -635,10 +641,33 @@ def main():
             if args.require_reviewed:
                 from verify_outputs import verify_folder
                 verify_folder(output,config)
-            # Music edits build on the finished, validated clips; a failed edit fails the run.
+            # Music edits build on the finished, validated clips. A broken edit does not stop the
+            # other edits or the clips, but it fails the run.
             from edits import render_edits
-            render_edits(source,plan,cache,config,output,english_transcript(source,cache,args.model),args.force)
+            transcript = english_transcript(source,cache,args.model)
+            found = []
+            if args.require_reviewed:
+                from selection import edit_plan_problems
+                try:
+                    found = edit_plan_problems(plan,duration,transcript)
+                except ValueError as exc:
+                    found = [str(exc)]
+                if found:
+                    print(f'WARNING — {source.name}: the clips are rendered, but the music edits have problems:'
+                          +''.join(f'\n  - {p}' for p in found),file=sys.stderr,flush=True)
+            render_error = None
+            try:
+                render_edits(source,plan,cache,config,output,transcript,args.force)
+            except ValueError as exc:
+                render_error = str(exc)
+            if found:
+                raise ValueError(f'{len(found)} music edit problem(s), listed above; the clips and the other edits are done.'
+                                 +(f'\n{render_error}' if render_error and not all(p in render_error for p in found) else ''))
+            if render_error:
+                raise ValueError(render_error)
         except Exception as exc:
+            if args.debug:
+                traceback.print_exc()
             print(f'ERROR — {source.name}: {exc}',file=sys.stderr,flush=True)
             failures.append(source)
     if args.prepare_review:
