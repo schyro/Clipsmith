@@ -4,7 +4,8 @@ import math
 import numpy as np
 
 # Tracking follows the upstream Light-ASD demo: tolerate up to 10 missed
-# detections and ignore tracks shorter than 10 frames.
+# detections and ignore tracks shorter than 10 frames. The numbers count 30 fps
+# frames; tracking on a source's own frames scales them by its frame rate.
 MAX_GAP = 10
 MIN_TRACK = 10
 STITCH_GAP = 20
@@ -37,17 +38,27 @@ def face_patch(frame, box):
     return gray[56:168, 56:168]
 
 
-def score_track(patches, audio_features, start_frame, fps=30):
-    """Return one synchronized audio-visual speaking logit per source frame."""
-    if len(patches) < 8:
-        return np.full(len(patches), -10., dtype=np.float32)
+def score_track(patches, audio_features, times, rate=1.0):
+    """One synchronized audio-visual speaking logit per frame of a face track.
+
+    `patches` are the track's face patches on the source's own frames, `times` the
+    frames' seconds on the clock of `audio_features` (100 per second), and `rate`
+    the source's frames per 30 fps frame. Light-ASD works at 25 fps, so the patch
+    nearest in time is used for each of its steps.
+    """
+    count = len(patches)
+    if count < max(2, round(8*rate)):
+        return np.full(count, -10., dtype=np.float32)
     import torch
     model, classifier = load_model()
-    n25 = max(2, int(round(len(patches)*25/fps)))
-    indices = np.minimum(len(patches)-1, np.rint(np.arange(n25)*fps/25).astype(int))
-    visual = np.asarray(patches, dtype=np.float32)[indices]
-    audio_start = int(round(start_frame/fps*100))
-    audio = audio_features[audio_start:audio_start+4*n25]
+    relative = np.asarray(times, dtype=float)-times[0]
+    duration = relative[-1]+float(np.median(np.diff(relative)))
+    n25 = max(2, int(round(duration*25)))
+    steps = np.arange(n25)/25
+    indices = np.searchsorted((relative[1:]+relative[:-1])/2, steps, side='right')
+    visual = np.asarray(patches)[indices]
+    audio_start = max(0, int(round(times[0]*100)))
+    audio = np.asarray(audio_features[audio_start:audio_start+4*n25], dtype=np.float32)
     if len(audio) < 4*n25:
         audio = np.pad(audio, ((0, 4*n25-len(audio)), (0, 0)), mode='edge')
     estimates = []
@@ -61,7 +72,7 @@ def score_track(patches, audio_features, start_frame, fps=30):
                 if end-begin < 2:
                     continue
                 a = torch.from_numpy(audio[4*begin:4*end].copy()).unsqueeze(0).float()
-                v = torch.from_numpy(visual[begin:end].copy()).unsqueeze(0)
+                v = torch.from_numpy(visual[begin:end].astype(np.float32)).unsqueeze(0)
                 audio_embed = model.forward_audio_frontend(a)
                 visual_embed = model.forward_visual_frontend(v)
                 logits = classifier(model.forward_audio_visual_backend(audio_embed, visual_embed))[:, 1].cpu().numpy()
@@ -69,10 +80,11 @@ def score_track(patches, audio_features, start_frame, fps=30):
                 counts[begin:end] += 1
             estimates.append(values/np.maximum(counts, 1))
     scores = np.mean(estimates, axis=0)
-    result = np.interp(np.arange(len(patches))/fps, np.arange(n25)/25, scores).astype(np.float32)
-    # Smoothing is restricted to this face track; it never crosses a camera cut.
+    # Smoothed over five 30 fps frames of this face track only; it never crosses a camera cut.
     from scipy.ndimage import uniform_filter1d
-    return uniform_filter1d(result, size=5, mode='nearest')
+    grid = np.arange(max(1, int(round(duration*30))))/30
+    smooth = uniform_filter1d(np.interp(grid, steps, scores), size=5, mode='nearest')
+    return np.interp(relative, grid, smooth).astype(np.float32)
 
 
 def iou(a, b):
@@ -92,8 +104,11 @@ def association_cost(a, b, gap=1):
     return distance+abs(math.log(ratio))-iou(a, b)
 
 
-def build_tracks(detections):
+def build_tracks(detections, rate=1.0):
     """Link per-frame boxes into face tracks inside one shot.
+
+    `rate` is the number of these frames per 30 fps frame (0.8 for a 23.976 fps
+    source), so the gap and length limits mean the same time at any frame rate.
 
     Matching uses centre distance relative to face size as well as overlap, so
     a moving or briefly missed face keeps one identity instead of breaking
@@ -101,11 +116,11 @@ def build_tracks(detections):
     """
     tracks = []
     for index, faces in enumerate(detections):
-        active = [k for k, t in enumerate(tracks) if index-t['indices'][-1] <= MAX_GAP]
+        active = [k for k, t in enumerate(tracks) if index-t['indices'][-1] <= MAX_GAP*rate]
         pairs = []
         for d, box in enumerate(faces):
             for k in active:
-                cost = association_cost(tracks[k]['boxes'][-1], box, index-tracks[k]['indices'][-1])
+                cost = association_cost(tracks[k]['boxes'][-1], box, (index-tracks[k]['indices'][-1])/rate)
                 if cost is not None:
                     pairs.append((cost, k, d))
         used_tracks, used_faces = set(), set()
@@ -118,11 +133,11 @@ def build_tracks(detections):
         for d, box in enumerate(faces):
             if d not in used_faces:
                 tracks.append({'indices': [index], 'boxes': [box]})
-    tracks = stitch_tracks(tracks)
-    return [t for t in tracks if len(t['indices']) >= MIN_TRACK]
+    tracks = stitch_tracks(tracks, rate)
+    return [t for t in tracks if len(t['indices']) >= MIN_TRACK*rate]
 
 
-def stitch_tracks(tracks):
+def stitch_tracks(tracks, rate=1.0):
     """Join a track that ends with a later one that starts at the same place."""
     tracks = sorted(tracks, key=lambda t: t['indices'][0])
     merged = True
@@ -132,9 +147,9 @@ def stitch_tracks(tracks):
             candidates = []
             for b in tracks:
                 gap = b['indices'][0]-a['indices'][-1]
-                if b is a or not 0 < gap <= STITCH_GAP:
+                if b is a or not 0 < gap <= STITCH_GAP*rate:
                     continue
-                cost = association_cost(a['boxes'][-1], b['boxes'][0], gap)
+                cost = association_cost(a['boxes'][-1], b['boxes'][0], gap/rate)
                 if cost is not None:
                     candidates.append((cost, id(b), b))
             if candidates:
@@ -165,25 +180,6 @@ def face_boxes(detector, frame):
     """YuNet boxes large enough for Light-ASD's mouth crop."""
     _, detected = detector.detect(frame)
     return [] if detected is None else [f[:4].astype(float) for f in detected if min(f[2], f[3]) >= 24]
-
-
-def analyze_shot(frames, first_frame, detections, audio_features, sample_width=640):
-    """Track and score only people visible in this exact camera shot.
-    `detections` holds the face boxes of every frame (see `face_boxes`)."""
-    import cv2
-    result = []
-    for track in build_tracks(detections):
-        positions, boxes = fill_gaps(track)
-        patches = [face_patch(frames[i], box) for i, box in zip(positions, boxes)]
-        scores = score_track(patches, audio_features, first_frame+positions[0])
-        sharpness = [float(cv2.Laplacian(p, cv2.CV_32F).var()) for p in patches]
-        result.append({'track': len(result),
-                       'start': int(positions[0]),
-                       'center_x': [round(float((b[0]+b[2]/2)/sample_width), 5) for b in boxes],
-                       'area': [round(float(b[2]*b[3])/sample_width**2, 6) for b in boxes],
-                       'sharpness': [round(s, 2) for s in sharpness],
-                       'score': [round(float(s), 3) for s in scores]})
-    return result
 
 
 # Path selection weights. Costs are per frame; lower is better.

@@ -1,42 +1,22 @@
 """Frame-accurate, fixed-aspect crops driven by visible active-speaker tracks.
 
 Two stages:
-1. `analyze` (slow, cached): exact camera cuts, face tracks and Light-ASD
-   speaking scores for every output frame.
+1. `analyze` (slow parts cached per source, see source_analysis.py): exact camera
+   cuts, face tracks and Light-ASD speaking scores for every output frame of a clip.
 2. `focus_plan` (fast): chooses the followed face per shot from those tracks,
    the transcript's speech timing and reviewed overrides.
 """
 import hashlib
 import json
 import math
-import os
-import subprocess
-import tempfile
-import threading
 
-ANALYSIS_VERSION = 3
-FPS = 30
-# Face detection runs on this many threads, each with its own YuNet instance.
-# Results are identical to one sequential detector; only the speed changes.
-DETECT_WORKERS = max(1, min(4, (os.cpu_count() or 4)//4))
+from source_analysis import ANALYSIS_VERSION, FPS, is_cut  # noqa: F401 (is_cut is part of this module's API)
 
 
 def geometry(stream, config):
     scale = max(config['width']/stream['width'], config['height']/stream['height'])
     return {'scaled_width': math.ceil(stream['width']*scale/2)*2,
             'scaled_height': math.ceil(stream['height']*scale/2)*2}
-
-
-def is_cut(previous, thumb, hist, previous_hist):
-    import cv2
-    import numpy as np
-    if previous is None:
-        return False
-    difference = float(np.mean(np.abs(thumb-previous)))/255
-    brightness = (float(np.mean(thumb))+float(np.mean(previous)))/510
-    relative = difference/max(.10, brightness)
-    hist_change = cv2.compareHist(hist, previous_hist, cv2.HISTCMP_BHATTACHARYYA)
-    return difference > .19 or (relative > .28 and hist_change > .30)
 
 
 def write_commands(path, frames, scaled_width, output_width):
@@ -66,109 +46,29 @@ def speech_frames(transcript, clip, frame_count, pad=3):
 
 
 def analysis_key(clip, config):
-    """Cache key inside the source's own work folder; independent of file name and time."""
-    from shorts import ROOT
-    weights = hashlib.sha256((ROOT/'assets/models/light_asd_talkset.model').read_bytes()).hexdigest()
+    """Names a clip's own files in the source's work folder (crop commands, the stored
+    slice of the analysis); independent of file name and time."""
+    from source_analysis import asd_weights
+    weights = asd_weights()
     return hashlib.sha256(json.dumps({
         'start': clip['start'], 'end': clip['end'], 'width': config['width'], 'height': config['height'],
         'version': ANALYSIS_VERSION, 'weights': weights}, sort_keys=True).encode()).hexdigest()[:16], weights
 
 
 def analyze(source, clip, cache, config, stream):
-    """Cut frames, face tracks and speaking scores for one clip (cached)."""
-    from shorts import ROOT, run, write_json
-    key, weights = analysis_key(clip, config)
+    """Cut frames, face tracks and speaking scores for one clip on its 30 fps grid.
+
+    The work is done per source and per camera shot (source_analysis.py); this slices
+    it, so a clip whose shots are known costs no decoding. The slice is also stored
+    as `speaker-tracks-<key>.json`, which marks the clip as analysed for the editor.
+    """
+    from shorts import write_json
+    from source_analysis import clip_analysis
+    result = clip_analysis(source, clip, cache, config, stream)
+    key, _ = analysis_key(clip, config)
     path = cache/f'speaker-tracks-{key}.json'
-    if path.exists():
-        return json.loads(path.read_text(encoding='utf-8'))
-    import cv2
-    import numpy as np
-    from concurrent.futures import ThreadPoolExecutor
-    from python_speech_features import mfcc
-    from scipy.io import wavfile
-    from active_speaker import analyze_shot, face_boxes
-    duration = clip['end']-clip['start']
-    print(f'Analyzing active speakers and exact cut frames: {clip["title"]}', flush=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        wav = f'{tmp}/speech.wav'
-        run(['ffmpeg', '-v', 'error', '-y', '-ss', clip['start'], '-i', source, '-t', duration,
-             '-vn', '-ar', '16000', '-ac', '1', wav])
-        rate, audio = wavfile.read(wav)
-    audio_features = mfcc(audio, rate, numcep=13, winlen=.025, winstep=.010)
-    width = 640
-    height = round(width*stream['height']/stream['width']/2)*2
-    model = str(ROOT/'assets/models/face_detection_yunet_2023mar.onnx')
-    local = threading.local()
-
-    def detect(frame):
-        if not hasattr(local, 'detector'):
-            local.detector = cv2.FaceDetectorYN.create(model, '', (width, height), .65, .3, 5000)
-        return face_boxes(local.detector, frame)
-
-    cmd = ['ffmpeg', '-v', 'error', '-ss', str(clip['start']), '-i', str(source), '-t', str(duration),
-           '-vf', f'setpts=PTS-STARTPTS,fps={FPS},scale={width}:{height}',
-           '-an', '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-']
-    frames, boxes, shots = [], [], []
-    first_frame = index = 0
-    previous = previous_hist = previous_frame = previous_boxes = None
-    scoring = None
-
-    def score_shot(shot_frames, shot_boxes, start, number):
-        tracks = analyze_shot(shot_frames, start, [b.result() for b in shot_boxes], audio_features, width)
-        print(f'  Shot {number}: frames {start}..{start+len(shot_frames)-1}, {len(tracks)} tracks', flush=True)
-        return {'start_frame': start, 'end_frame': start+len(shot_frames), 'tracks': tracks}
-
-    def finish_shot():
-        # One shot is scored in the background while the next one is decoded and
-        # detected; shots are still collected strictly in order.
-        nonlocal scoring
-        if scoring is not None:
-            shots.append(scoring.result())
-        scoring = scorer.submit(score_shot, frames, boxes, first_frame, len(shots)+1) if frames else None
-
-    with tempfile.TemporaryFile() as errors, ThreadPoolExecutor(DETECT_WORKERS) as detectors, \
-            ThreadPoolExecutor(1) as scorer:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors)
-        try:
-            while True:
-                raw = process.stdout.read(width*height*3)
-                if not raw:
-                    break
-                if len(raw) != width*height*3:
-                    raise RuntimeError('Speaker analysis received an incomplete video frame.')
-                frame = np.frombuffer(raw, np.uint8).reshape(height, width, 3).copy()
-                thumb = cv2.resize(frame, (64, 36)).astype(np.float32)
-                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                hist = cv2.calcHist([hsv], [0, 1], None, [24, 24], [0, 180, 0, 256])
-                cv2.normalize(hist, hist)
-                # Every output frame is compared, so a cut is found on its exact frame.
-                if is_cut(previous, thumb, hist, previous_hist):
-                    finish_shot()
-                    frames, boxes = [], []
-                    first_frame = index
-                # Frame-rate conversion repeats source frames; a repeat has the same faces.
-                if previous_frame is None or not np.array_equal(frame, previous_frame):
-                    previous_boxes = detectors.submit(detect, frame)
-                frames.append(frame)
-                boxes.append(previous_boxes)
-                previous, previous_hist, previous_frame = thumb, hist, frame
-                index += 1
-            finish_shot()
-            if scoring is not None:
-                shots.append(scoring.result())
-        except BaseException:
-            process.kill(); process.wait()
-            detectors.shutdown(cancel_futures=True)
-            scorer.shutdown(cancel_futures=True)
-            raise
-        finally:
-            process.stdout.close()
-        if process.wait():
-            errors.seek(0)
-            raise RuntimeError(errors.read().decode('utf-8', errors='replace')[-2000:])
-    result = {'version': ANALYSIS_VERSION, 'fps': FPS, 'frame_count': index,
-              'weights_sha256': weights, 'shots': shots}
-    write_json(path, result)
+    if not path.exists():
+        write_json(path, result)
     return result
 
 
@@ -187,7 +87,11 @@ def focus_plan(source, clip, cache, config, transcript, commands_path=None):
     stream = next(s for s in probe(source)['streams'] if s['codec_type'] == 'video')
     size = geometry(stream, config)
     overrides = clip.get('focus_overrides', [])
-    analysis = analyze(source, clip, cache, config, stream)
+    if commands_path is False:
+        from source_analysis import clip_analysis
+        analysis = clip_analysis(source, clip, cache, config, stream)  # previews and montage shots leave no files
+    else:
+        analysis = analyze(source, clip, cache, config, stream)
     for override in overrides:
         if any(override['start_frame'] < shot['start_frame'] < override['end_frame'] for shot in analysis['shots']):
             raise ValueError('Split focus overrides at camera cuts; an override cannot target the next shot early.')
