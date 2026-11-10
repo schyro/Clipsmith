@@ -117,6 +117,40 @@ class MusicAnalysisTests(unittest.TestCase):
             track, loaded = music.load_track('song.wav', folder)
             self.assertEqual(12.5, loaded['drop'])
 
+    def test_scan_adds_beat_profiles_to_an_old_sidecar_without_touching_user_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            synthetic_track(folder/'song.wav', 120, .5, 20.5, 32)
+            music.scan(folder, out=lambda *_: None)
+            path = folder/'song.json'
+            data = json.loads(path.read_text(encoding='utf-8'))
+            # An analysis-version-1 sidecar the user edited: a mood, and the drop moved to another beat.
+            for c in data['drop_candidates']:
+                for key in list(c):
+                    if key not in ('time', 'rise_db'):
+                        del c[key]
+            del data['analysis']
+            data.update(mood='dark', drop=24.5)
+            path.write_text(json.dumps(data), encoding='utf-8')
+            messages = []
+            music.scan(folder, out=messages.append)
+            again = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(['Beat profiles updated: song.wav'], messages)
+            self.assertEqual(('dark', 24.5), (again['mood'], again['drop']))
+            self.assertEqual(data['bpm'], again['bpm'])
+            self.assertEqual(data['first_beat'], again['first_beat'])
+            self.assertEqual({'version': music.ANALYSIS_VERSION, 'bpm': data['bpm'], 'first_beat': data['first_beat'],
+                              'drop': 24.5}, again['analysis'])
+            self.assertTrue(all(len(c['beats']) == music.PROFILE_BEATS for c in again['drop_candidates']
+                                if c['time']+16 < 32), again['drop_candidates'])
+            # The user's own drop gets a profile too (on the detected grid, within a few ms).
+            self.assertTrue(any(abs(c['time']-24.5) < .015 and c.get('source') == 'sidecar drop'
+                                for c in again['drop_candidates']), again['drop_candidates'])
+            # Nothing changed since: the next scan leaves the file alone.
+            messages.clear()
+            music.scan(folder, out=messages.append)
+            self.assertEqual([], messages)
+
     def test_loudness_is_measured_in_lufs(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'track.wav'
@@ -124,6 +158,83 @@ class MusicAnalysisTests(unittest.TestCase):
             quiet = music.loudness(path, 1, 8)
             loud = music.loudness(path, 12, 8)
         self.assertGreater(loud-quiet, 10)
+
+
+def accented_track(path, bpm, first_beat, drop, duration, accent):
+    """Quiet ticks before `drop`; after it a kick on every beat, and on the beats where
+    `accent(k)` is true (k counted from the drop) a loud broadband crash as well."""
+    rng = np.random.default_rng(2)
+    out = np.zeros(int(duration*SR))
+    period = 60/bpm
+    for beat in np.arange(first_beat, duration, period):
+        i = int(round(beat*SR))
+        k = round((beat-drop)/period)
+        if k < 0:
+            n = int(.02*SR)
+            out[i:i+n] += (rng.standard_normal(n)*np.exp(-np.arange(n)/(.004*SR))*.05)[:len(out)-i]
+            continue
+        n = int(.15*SR)
+        t = np.arange(n)/SR
+        out[i:i+n] += (np.sin(2*np.pi*(50+80*np.exp(-t/.02))*t)*np.exp(-t/.06)*.5)[:len(out)-i]
+        if accent(k):
+            m = int(.12*SR)
+            out[i:i+m] += (rng.standard_normal(m)*np.exp(-np.arange(m)/(.03*SR))*.6)[:len(out)-i]
+    wavfile.write(path, SR, (np.clip(out, -1, 1)*32000).astype(np.int16))
+
+
+class GridTests(unittest.TestCase):
+    TRACK = {'bpm': 120.0, 'first_beat': .1, 'drop': 30.1, 'duration': 60.0}
+
+    def test_the_grid_is_first_beat_plus_whole_beats(self):
+        self.assertAlmostEqual(30.1, music.grid_beat(self.TRACK, 30.06)[0])
+        self.assertAlmostEqual(-.04, music.grid_beat(self.TRACK, 30.06)[1])
+        # Millisecond rounding of the sidecar keeps the time as written; a real offset snaps.
+        self.assertEqual(30.101, music.on_grid(self.TRACK, 30.101)[0])
+        self.assertAlmostEqual(30.1, music.on_grid(self.TRACK, 30.13)[0])
+        # Without first_beat the grid runs through the time itself.
+        self.assertEqual((29.97, 0.0), music.grid_beat({'bpm': 120.0}, 29.97))
+
+    def test_a_drop_off_its_grid_is_reported_with_the_first_beat_that_fits_it(self):
+        self.assertIsNone(music.drop_grid_warning('song', self.TRACK))
+        warning = music.drop_grid_warning('song', {**self.TRACK, 'drop': 30.0})
+        self.assertIn('-100 ms off the beat grid', warning)
+        self.assertIn('nearest beat, 30.100 s', warning)
+        self.assertIn('first_beat to 0.0000', warning)
+
+    def test_strongest_beats_and_bar_labels(self):
+        self.assertEqual([0, 4, 6], music.strongest_beats([.9, .1, .2, .1, .8, 0, .7, .1], 3))
+        self.assertEqual([0], music.strongest_beats([.9, .1, .2, .1, .8], 2, limit=2)[:1])
+        self.assertEqual('+6 (bar 2.3)', music.beat_label(6))
+        self.assertEqual(4, music.accent_beat([.1, 0, .1, .9]*4))
+        self.assertIsNone(music.accent_beat([.5, .1, .5, .1]*4))  # half-bar hits: no clear bar position
+
+
+@unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
+class BeatProfileTests(unittest.TestCase):
+    def profile(self, accent):
+        # Measured on the true grid, as for a sidecar the user has checked.
+        track = {'bpm': 100.0, 'first_beat': .3, 'drop': 14.7, 'duration': 40.0, 'drop_candidates': []}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'accent.wav'
+            accented_track(path, 100, .3, 14.7, 40, accent)
+            candidates, analysis = music.rhythm_fields(path, track)
+        self.assertEqual(14.7, analysis['drop'])
+        self.assertEqual('sidecar drop', candidates[0]['source'])
+        return track, candidates[0]
+
+    def test_accented_beats_are_the_strongest_and_the_bar_position_follows_the_drop(self):
+        found, drop = self.profile(lambda k: k % 4 == 0)
+        self.assertEqual(music.PROFILE_BEATS, len(drop['beats']))
+        self.assertEqual([0, 4, 8, 12], music.strongest_beats(drop['beats'], 4, 16))
+        self.assertEqual(1, drop['accent_beat'])
+        # The descriptors: louder and busier after the drop.
+        self.assertGreater(drop['after_db']-drop['before_db'], 10)
+        self.assertGreater(drop['onsets_after'], drop['onsets_before'])
+
+    def test_hits_on_the_fourth_beat_say_the_drop_may_not_be_a_downbeat(self):
+        found, drop = self.profile(lambda k: k % 4 == 3)
+        self.assertEqual(4, drop['accent_beat'])
+        self.assertIn('may not be a downbeat', music.describe_candidate(drop, 60/found['bpm']))
 
 
 if __name__ == '__main__':

@@ -21,13 +21,22 @@ For every track without one, this writes a sidecar `Music/<name>.json`:
 
 ```json
 {"file": "song.mp3", "mood": "", "bpm": 128.03, "first_beat": 0.009, "drop": 30.47, "duration": 64.0,
- "drop_candidates": [{"time": 30.47, "rise_db": 21.9}, {"time": 15.47, "rise_db": 11.3}],
- "detected": {"bpm": 128.03, "first_beat": 0.009, "drop": 30.47, "version": 1, "file_hash": "..."}}
+ "drop_candidates": [{"time": 30.47, "rise_db": 21.9, "before_db": -9.1, "after_db": 1.8,
+                      "onsets_before": 0.4, "onsets_after": 2.1, "accent_beat": null, "beats": [0.92, 0.31, ...]},
+                     {"time": 15.47, "rise_db": 11.3, ...}],
+ "analysis": {"version": 2, "bpm": 128.03, "first_beat": 0.009, "drop": 30.47},
+ "detected": {"bpm": 128.03, "first_beat": 0.009, "drop": 30.47, "version": 2, "file_hash": "..."}}
 ```
 
 - `mood` is for the user: a few words about the feel ("funny, smug", "sad, slow build"). The agent cannot hear the music and picks tracks by this field.
-- `bpm`, `first_beat` and `drop` (seconds) are detected and can be corrected by hand. `drop_candidates` lists the next-best drops.
-- A scan never overwrites a sidecar. If the audio file changes, the scan warns; delete the sidecar to detect again.
+- `bpm`, `first_beat` and `drop` (seconds) are detected and can be corrected by hand. The beat grid is `first_beat` + k × 60/`bpm`, and every cut of an edit sits on it. The drop an edit uses is the grid beat nearest `drop`. A `drop` more than 10 ms off the grid is reported, by the scan and by the plan check, with the `first_beat` that would put it on the grid: either the drop or the grid is then wrong. Offsets below 2 ms are the sidecar's millisecond rounding and keep the drop as written.
+- `drop_candidates` lists the next-best drops, and the sidecar's own `drop` when it is not among them. Each is measured on the sidecar's grid:
+  - `beats`: onset strength (0–1 of the track's strongest onset) of the 32 beats from that drop on. Beat 0 is the drop. Bars are counted from the drop as a downbeat: no downbeat estimate proved reliable on the user's tracks (several fast tracks look double-time, with equal hits on beats 1 and 3).
+  - `accent_beat`: the bar position (1–4) where the hits clearly concentrate (at least twice any other position), else null. A value other than 1 means the drop may not be a downbeat.
+  - `before_db`, `after_db`: level of the 8 s before and after the drop, in dB against the whole track. `onsets_before`, `onsets_after`: onsets per second there. Together they say whether the drop is a jump out of a quiet build or a change inside a busy part.
+  - Vocals are not detected: no numpy-only measure separated sung or rapped parts from melodic synths reliably enough to report.
+- `analysis` records the grid and drop the profiles were measured on. A scan never changes `mood`, `bpm`, `first_beat` or `drop`. It refreshes `drop_candidates` and `analysis` when they are missing, come from an older analysis version, or were measured on a grid or drop the user has since corrected. If the audio file changes, the scan warns instead; delete the sidecar to detect again.
+- `--scan-music` prints, per track, the beat length in seconds and frames, then each drop candidate with its rise, levels, onset rates and its four strongest beats within a 9 s montage (`+10 (bar 3.3)`), and the warnings above. Put flashes and the strongest shots on the strongest beats.
 
 Detection (`music.py`, numpy and scipy only) takes the positive spectral flux of the log spectrum as an onset envelope and fits the constant-tempo grid (60–200 BPM, any phase) that collects the most onset strength over the whole track, so a grid twice too slow or too fast loses. The envelope peak sits a fixed 36 ms before the heard onset (measured, ±3 ms), which is corrected. The drop is the beat with the largest energy rise from the 8 beats before to the 8 beats after it, broadband and bass combined. Tests check tempo, phase (within 15 ms, half a 30 fps frame) and drop on synthetic tracks at 95, 128 and 150 BPM.
 
@@ -66,10 +75,18 @@ Edits live in the plan's top-level `edits` block, keyed by clip id. A clip's own
 | `grade` | Optional montage grade: `none`, `bw` or `warm` (`edit_settings.json`). When omitted, Copper has its own muted colour grade and other profiles use `none`. The grade applies to the montage only. |
 | `transition` | At the drop: `white_flash`, `black_flash` or `cut`. |
 | `effects` | `copper` for new editorial plans. `soft` (when omitted), `strong` and `none` retain their existing behaviour. |
+| `drop` | Optional time in the track (seconds) to drop on instead of the sidecar's `drop`, usually another of its `drop_candidates`. It must lie within 20 ms of a beat of the track's grid and is moved onto that beat. |
 | `cut_beats` | Optional beats per montage slot: 0.5, 1, 2 or 4. By default, the fewest beats that give at least 0.45 s per cut. |
-| `montage` | Shots in source seconds, in order. Each fills one slot (`slots` holds it longer). The montage must last 4–9 s; the check names the slot count that fits. `center_x` (0–1, source-normalised) overrides the crop centre; `flash` (`white`, `black` or `none`) selects an accent on that shot after the drop. The edit's `transition` controls the drop itself. See the extra Copper shot fields below. |
+| `montage` | Shots in source seconds, in order. A shot lasts its own `beats` (whole or half beats: 0.5, 1, 1.5, ...), or else `slots` × `cut_beats` (one slot when neither is given; one shot cannot have both). The montage must last 4–9 s; the check names the beat or slot count that fits. `center_x` (0–1, source-normalised) overrides the crop centre; `flash` (`white`, `black` or `none`) selects an accent on that shot after the drop. The edit's `transition` controls the drop itself. See the extra Copper shot fields below. |
 | `music_lufs` | Optional loudness of the music after the drop (default −9 LUFS). |
+| `bar_note` | The answer to the bar warning: why the montage should end mid-bar. |
 | `approved` | Set by `--apply-review`; locks the edit. |
+
+### Rhythm
+
+Per-shot `beats` let the montage breathe: long shots to establish, halves for a stutter, a hold to land. For example `2, 2, 1, 1, 0.5, 1, 0.5, 2, 2` is 12 beats, three bars. Cuts still come from absolute beat times (cut *k* on frame round(D + beats before it × beat × 30)), so they never drift. A shot must last at least 6 frames. When one is shorter, the check names the smallest beat value that works at the track's tempo: above about 150 BPM half a beat is under 6 frames. Fast tracks may be detected at double tempo, where four beats are half a bar; check the bar count against the strength profile.
+
+A montage whose total is not a multiple of four beats does not end on a bar line. The check and the render print a warning, also recorded under `warnings` in `<stem>.edit.json`; it does not stop the render. Answer it by changing the pattern, or with the edit's `bar_note` saying why it should end mid-bar.
 
 Defaults (bed level, tail length, flash frames, grades, limiter, checks) live in `edit_settings.json`; changing them re-renders edits only, never clips.
 
@@ -124,6 +141,8 @@ The montage sheet shows each shot with this look, as rendered.
 
 `./run.cmd --require-reviewed --analyze-only` checks the edits with the plan: every field, the payoff word inside its clip, the drop before the clip end, the montage length, enough track after the drop, and every shot inside the source. With edits in the plan it also runs the speaker analysis on each montage shot. A shot that crosses a camera cut is refused with the times to move it to. The crop centre follows the visible (speaking) face, as in a clip, or uses the reviewed `center_x`. The run writes `Review/<id>/edits/<stem>-montage.jpg`. Copper shows entry, motion and exit frames through the export filters. Earlier profiles show a graded frame from the middle of each shot. Use the sheet to verify the featured character, the pivot and the source window.
 
+The check also measures motion in every shot's source window: the mean grey change between frames of the crop as rendered, on the 30 fps grid. Repeated frames are skipped (film on the 30 fps grid repeats every fifth frame). A peak counts when it changes at least 1 % of the grey range and 1.5 times the window's typical change; otherwise the shot is reported as having no clear motion. For a clear peak the check prints the output frame it lands on and the `start` values that would put it on the cut, on the next beat inside the shot, and, for a Copper `ramp`, on the slowest part of the ramp (the peak is mapped through the ramp's time curve). Write the one you want into the plan and check again: the new window is checked for camera cuts like any other. On the Copper sheet the middle tile of a shot without a push is its peak frame (`peak f9`). Frame difference finds the largest change; it cannot tell a gesture from a camera move or someone crossing the frame, so look at the tile.
+
 ## Rendering
 
 `./run.cmd --require-reviewed` renders the clips, then every edit, into `<profile>/edits/`:
@@ -140,18 +159,18 @@ Timeline, on the 30 fps grid:
   1. The clip's dialogue, already normalised, starts and ends with a 30 ms fade.
   2. Before the drop, the music plays as a bed. Its level comes from two measurements (EBU R128): the dialogue in the edit, and the part of the track that actually plays under it, which in most tracks is a quieter intro or breakdown. The bed is set `bed_below_dialogue_db` (9 dB) under the dialogue and dips a few dB more under speech (`sidechaincompress`, ratio 2.5).
   3. From the drop, it plays at its full level: the post-drop part of the track is measured (EBU R128) and brought to −9 LUFS.
-  4. The music fades out over the tail.
+  4. The music fades out over the black tail only: the fade lasts `music_fade_out_seconds` (0.6 s) or the tail, whichever is shorter, so the last shot ends at full level. (Copper's 0.3 s tail used to let the fade start 0.3 s before the last cut.)
   5. Only a limiter runs on the final mix, so the drop keeps its jump. A whole-mix `loudnorm` would flatten it.
 - **No-music file.** The same picture (stream copy) with the dialogue only, silent from the drop.
 
-An edit whose inputs are unchanged is reused. An approved edit is kept as it is until the approval is withdrawn.
+An edit whose inputs are unchanged is reused. An approved edit is kept as it is until the approval is withdrawn. While its finished files are in place it needs neither its track nor the montage analysis, so the check and the render pass even when its track has left `Music/`.
 
 ## Acceptance checks
 
 Each rendered edit is checked, and a failure fails the run:
 
 - **Frames:** the frame count matches the timeline.
-- **Cuts:** around every expected montage cut and the cut to the black tail, the frame-to-frame picture change must start on that frame (the first frame that reaches half of the largest change nearby, so a flash or strobe right after the cut does not count as the cut). This works in black and white too. More than one frame off fails. A cut between two very similar shots has no clear peak and is listed as unclear.
+- **Cuts:** around every expected montage cut, whatever the rhythm pattern, and the cut to the black tail, the frame-to-frame picture change must start on that frame (the first frame that reaches half of the largest change nearby, so a flash or strobe right after the cut does not count as the cut). This works in black and white too. More than one frame off fails. A cut between two very similar shots has no clear peak and is listed as unclear.
 - **Drop:** the second after the drop is at least 6 dB louder than the second before it.
 - **Bed:** the music under the dialogue (the music file minus the no-music file) sits 4–16 dB under the dialogue, so it is heard without covering the words.
 - **Delay:** the drop lies 0.1–0.5 s after the payoff word.
