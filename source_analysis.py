@@ -447,6 +447,7 @@ def analyze_run(source, cache, grid, size, bounds, features, weights):
                     spans, patches = track_patches(tracks, frames)
                     if not keep:
                         frames.close()
+                    del frames
                 del kept
                 times = [frame_time(grid, i) for i in range(start, start+len(detections))]
                 records.append(scorer.submit(score_shot, start, end, spans, patches, times, features, rate,
