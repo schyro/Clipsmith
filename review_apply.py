@@ -1,8 +1,11 @@
 """Apply gallery review decisions to the plan, then re-render what changed.
 
 Mechanical decisions are applied directly:
+- kept (triage of a clip that was never rendered): the clip gets `kept` in the plan
+  and renders; its entry then goes back to pending for the full review;
 - approved: the clip is locked (not re-rendered until --force or un-approval);
-- rejected: the clip moves to the plan's `rejected_clips` and its files to rejected/;
+- rejected: the clip moves to the plan's `rejected_clips` with its reasons, and its
+  files to rejected/;
 - needs changes with framing staged in the editor: the reviewed focus_overrides
   replace the clip's overrides (before any re-cut, since they use its frames);
 - needs changes with moved edges: the new start/end are kept off spoken words.
@@ -122,10 +125,11 @@ def shift_clip_timing(clip, new_start, new_end, grid=None):
     return updated
 
 
-def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, grid=None):
+def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, grid=None, unrendered=()):
     """Change the plan in place. Returns (notes per clip id, ids applied mechanically).
     `handled`, when given, is filled with the set of options handled per clip id;
-    `grid` (frame_grid.FrameGrid) keeps re-cut overrides on their source frames."""
+    `grid` (frame_grid.FrameGrid) keeps re-cut overrides on their source frames;
+    `unrendered` are the ids of clips that were never rendered (triage candidates)."""
     from gallery import clip_key
     notes, done = {}, set()
     handled = {} if handled is None else handled
@@ -135,6 +139,12 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, gri
         key = clip_key(clip)
         entry = entries.get(key)
         status = (entry or {}).get('status', 'pending')
+        if key in unrendered and status in ('kept', 'approved', 'needs_changes'):
+            # Any decision but a rejection sends a triage candidate to the render.
+            clip.setdefault('kept', {'at': entry.get('updated', timestamp)})
+            notes[key] = 'Kept in triage; rendered for the full review.'
+        elif status == 'kept':
+            notes[key] = 'Kept; the clip is already rendered and back in the review.'
         if status == 'approved':
             if not clip.get('approved'):
                 clip['approved'] = {'at': entry.get('updated', timestamp)}
@@ -142,11 +152,14 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, gri
         elif clip.pop('approved', None):
             notes[key] = 'Approval withdrawn; the clip renders normally again.'
         if status == 'rejected' and not entry.get('addressed'):
-            rejected = {**clip, 'rejected_at': timestamp, 'review_comment': entry.get('comment', '')}
+            rejected = {**clip, 'rejected_at': timestamp, 'review_comment': entry.get('comment', ''),
+                        'reject_reasons': list(entry.get('reasons') or []),
+                        'rejected_stage': 'triage' if key in unrendered else 'review'}
             if entry.get('notes'):
                 rejected['review_notes'] = [dict(n) for n in entry['notes']]
             plan.setdefault('rejected_clips', []).append(rejected)
-            notes[key] = 'Removed from the plan; files moved to rejected/.'
+            notes[key] = ('Rejected in triage; never rendered.' if key in unrendered
+                          else 'Removed from the plan; files moved to rejected/.')
             done.add(key)
             continue
         open_change = status == 'needs_changes' and not entry.get('addressed')
@@ -167,7 +180,7 @@ def apply_to_plan(plan, decisions, words, duration, timestamp, handled=None, gri
             handled.setdefault(key, set()).add('recut')
             done.add(key)
         if said:
-            notes[key] = ' '.join(said)
+            notes[key] = ' '.join(([notes[key]] if key in notes else [])+said)
         kept.append(clip)
     plan['clips'] = kept
     return notes, done
@@ -217,10 +230,47 @@ def closes(entry, done_options):
         and not entry.get('comment') and not entry.get('notes')
 
 
-def apply_review(output: Path, root: Path, config, force=False, model='medium'):
+def rendered_ids(root: Path, plan):
+    """Ids of the source's clips that any output profile has rendered."""
+    from shorts import output_name
+    ids = set()
+    for index in (Path(root)/'Output'/output_name(plan)).glob('*/clips.json'):
+        try:
+            ids |= {c.get('id') for c in json.loads(index.read_text(encoding='utf-8-sig'))}
+        except (OSError, ValueError):
+            continue
+    return ids
+
+
+def awaiting_triage(plan, root: Path):
+    """Ids of candidates nobody has kept yet that were never rendered. The render skips
+    them until the user keeps them in the editor's triage (or `--no-triage` is given)."""
+    done = rendered_ids(root, plan)
+    return [c['id'] for c in plan['clips'] if c['id'] not in done and not c.get('kept') and not c.get('approved')]
+
+
+def triage_view(plan, waiting):
+    """The plan without the candidates that wait for triage, nor their music edits."""
+    waiting = set(waiting)
+    if not waiting:
+        return plan
+    view = {**plan, 'clips': [c for c in plan['clips'] if c['id'] not in waiting]}
+    if plan.get('edits'):
+        view['edits'] = {k: v for k, v in plan['edits'].items() if k not in waiting}
+    return view
+
+
+def report_waiting(waiting):
+    if waiting:
+        print(f'{len(waiting)} candidate(s) wait for triage and were not rendered: {", ".join(waiting)}. '
+              'Keep or reject them in the clip editor (run --review-gallery).', flush=True)
+
+
+def apply_review(output: Path, root: Path, config, force=False, model=None):
     from gallery import DECISIONS_FILE, actionable, load_decisions, note_time, now_iso, save_decisions, write_gallery
     from shorts import (clip_files, clip_stem, english_transcript, find_source, load_plan, probe,
                         render_plan, validate_plan, write_json)
+    from editor_ops import source_model
     output = Path(output)
     decisions = load_decisions(output)
     if decisions is None:
@@ -231,17 +281,22 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
     duration = float(probe(source)['format']['duration'])
     plan = load_plan(plan_path, source_id, duration)
     cache = Path(root)/'work'/source_id
+    model = source_model(cache, model)
     transcript = english_transcript(source, cache, model)
     words = [w for s in transcript['segments'] for w in s.get('words', [])]
     from frame_grid import load_grid
     grid = load_grid(source, cache)
     timestamp = now_iso()
     before = {c['id']: c for c in plan['clips']}
+    unrendered = set(before)-rendered_ids(root, plan)
     handled = {}
-    notes, done = apply_to_plan(plan, decisions, words, duration, timestamp, handled, grid)
+    notes, done = apply_to_plan(plan, decisions, words, duration, timestamp, handled, grid, unrendered)
     edit_notes = apply_edits_to_plan(plan, decisions, timestamp)
-    validate_plan(plan, source_id, duration)
+    if plan['clips']:  # a triage may reject every candidate
+        validate_plan(plan, source_id, duration)
     write_json(plan_path, plan)
+    write_preferences(root)
+    waiting = awaiting_triage(plan, root)
     # Archive rejected clips explicitly, before render_plan tidies the folder.
     for key in done:
         if key not in {c['id'] for c in plan['clips']} and key in before:
@@ -252,12 +307,15 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
     if config['profile'] != output.name:
         print(f'Note: rendering into the current profile {config["profile"]}, not {output.name}.', flush=True)
     pending = snapshot_history(output)
-    target = render_plan(source, plan, cache, config, force, model, plan_path)
+    target = render_plan(source, plan, cache, config, force, model, plan_path, skip=waiting)
     finalize_history(output if target == output else None, pending)
     current = {c['id']: c for c in plan['clips']}
     for key, note in notes.items():
         entry = decisions['clips'][key]
         entry['agent_note'] = note
+        if entry.get('status') == 'kept':
+            # Rendered now: the clip comes back for the full review.
+            entry.update({'status': 'pending', 'kept_at': timestamp})
         if key in done:
             entry.update({'start_shift': 0, 'end_shift': 0})
             entry.pop('focus_overrides', None)
@@ -283,10 +341,11 @@ def apply_review(output: Path, root: Path, config, force=False, model='medium'):
     from edits import render_edits
     edit_error = None
     try:
-        render_edits(source, plan, cache, config, target, transcript, force)
+        render_edits(source, triage_view(plan, waiting), cache, config, target, transcript, force)
     except ValueError as exc:
         edit_error = str(exc)
     remaining = actionable(decisions)
+    report_waiting(waiting)
     print(f'Applied {len(notes)+len(edit_notes)} decision(s).', flush=True)
     for key, note in sorted(notes.items()):
         print(f'  [{key}] {note}', flush=True)
@@ -355,3 +414,91 @@ def finalize_history(output, pending):
 def history_file(output: Path, clip_id):
     path = Path(output)/HISTORY/f'{clip_id}.mp4'
     return path if path.exists() else None
+
+
+# ---------- the preference record the agent reads before selecting ----------
+
+PREFERENCES_FILE = 'review-preferences.md'
+
+
+def _length(clip):
+    return float(clip['end'])-float(clip['start'])
+
+
+def _median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    middle = len(values)//2
+    return values[middle] if len(values) % 2 else (values[middle-1]+values[middle])/2
+
+
+def _clip_line(source, clip, stage=True):
+    text = f'- {source} #{clip.get("id", "?")} "{clip.get("title", "")}", {_length(clip):.1f} s'
+    if stage and clip.get('rejected_stage'):
+        text += ', rejected in triage (not rendered)' if clip['rejected_stage'] == 'triage' else ', rejected after rendering'
+    text += '.'
+    if clip.get('reason'):
+        text += f' Plan reason: {clip["reason"]}'
+    if clip.get('review_comment'):
+        text += f' Comment: "{" ".join(clip["review_comment"].split())}"'
+    for note in clip.get('review_notes') or []:
+        text += f' Note at {note["t"]:.1f} s: "{note["text"]}"'
+    return text
+
+
+def preferences_markdown(plans, timestamp):
+    """A factual summary of the user's decisions across `plans` (a list of plan dicts):
+    rejected clips grouped by the reasons they picked, and the approved clips."""
+    from gallery import REJECT_REASONS
+    rows, rejected, approved = [], [], []
+    for plan in plans:
+        source = Path(plan.get('source', '?')).stem
+        gone = plan.get('rejected_clips') or []
+        ok = [c for c in plan.get('clips') or [] if c.get('approved')]
+        rows.append((source, len(plan.get('clips') or [])+len(gone), len(ok), len(gone),
+                     len(plan.get('clips') or [])-len(ok)))
+        rejected += [(source, c) for c in gone]
+        approved += [(source, c) for c in ok]
+    lines = ['# Review preferences', '',
+             f'Rebuilt from every plan in `Plans/` by `--apply-review` ({timestamp}); edits here are overwritten.',
+             'It records what the user approved and rejected, with the reasons they picked in the clip editor. '
+             'It lists decisions, not rules.', '',
+             '| Source | Candidates | Approved | Rejected | Not decided yet |', '|---|---|---|---|---|']
+    for row in rows:
+        lines.append('| '+' | '.join(str(v) for v in row)+' |')
+    total = [sum(r[i] for r in rows) for i in range(1, 5)]
+    lines += ['| All | '+' | '.join(str(v) for v in total)+' |', '']
+    groups = [(label, [(s, c) for s, c in rejected if code in (c.get('reject_reasons') or [])])
+              for code, label in REJECT_REASONS.items()]
+    groups.append(('No reason given', [(s, c) for s, c in rejected if not c.get('reject_reasons')]))
+    lines += ['A rejected clip with several reasons counts under each of them.', '',
+              '| Decision | Clips | Median length |', '|---|---|---|']
+    for label, items in [*[(f'Rejected: {label}', items) for label, items in groups], ('Approved', approved)]:
+        median = _median([_length(c) for _, c in items])
+        lines.append(f'| {label} | {len(items)} | {"-" if median is None else f"{median:.1f} s"} |')
+    for label, items in groups:
+        if items:
+            lines += ['', f'## Rejected: {label} ({len(items)})', '']+[_clip_line(s, c) for s, c in items]
+    if approved:
+        lines += ['', f'## Approved ({len(approved)})', '']+[_clip_line(s, c, False) for s, c in approved]
+    return '\n'.join(lines)+'\n'
+
+
+def write_preferences(root: Path):
+    """Rebuild Plans/review-preferences.md from every plan, so it never drifts from them."""
+    from gallery import now_iso
+    folder = Path(root)/'Plans'
+    plans = []
+    for path in sorted(folder.glob('*.json')):
+        try:
+            data = json.loads(path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get('clips'), list):
+            plans.append(data)
+    if not plans:
+        return None
+    path = folder/PREFERENCES_FILE
+    path.write_text(preferences_markdown(plans, now_iso()), encoding='utf-8')
+    return path
