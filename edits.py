@@ -35,13 +35,19 @@ import copper
 from frame_grid import FPS
 
 EDIT_VERSION = 6
-COPPER_VERSION = 7
+COPPER_VERSION = 8
 CUT_BEATS = (.5, 1, 2, 4)
 EDIT_KEYS = {'track', 'payoff_word', 'drop_delay', 'grade', 'transition', 'cut_beats', 'montage', 'reason',
-             'approved', 'music_lufs', 'dialogue_start', 'effects'}
+             'approved', 'music_lufs', 'dialogue_start', 'effects', 'drop', 'bar_note'}
 MIN_DIALOGUE = 3.0  # seconds of dialogue before the drop
-SHOT_KEYS = {'start', 'center_x', 'slots', 'reason', 'flash'}
-NON_RENDER_KEYS = {'reason', 'approved'}
+MIN_SHOT_FRAMES = 6
+BAR_BEATS = 4
+EDIT_DROP_TOLERANCE = .02  # an edit's own `drop` must lie this close to a beat of the track's grid
+SHOT_KEYS = {'start', 'center_x', 'slots', 'beats', 'reason', 'flash'}
+NON_RENDER_KEYS = {'reason', 'approved', 'bar_note'}
+# Timeline fields that only describe the edit; they stay out of the render signature so
+# adding them did not re-render existing edits.
+TIMELINE_INFO_KEYS = {'shot_beats', 'montage_beats', 'track_drop', 'drop_offset'}
 
 
 def edit_settings(root: Path | None = None):
@@ -68,6 +74,35 @@ def choose_cut_beats(period, low, high):
         if low <= beats*period <= high:
             return beats
     return min(CUT_BEATS, key=lambda b: min(abs(b*period-low), abs(b*period-high)))
+
+
+def track_drop(track, edit):
+    """(drop time used, its offset from the beat grid) for an edit. The drop is always a
+    grid beat (`first_beat` + k x beat): the edit's own `drop` or the sidecar's, moved onto
+    the nearest beat. An edit's own drop further than EDIT_DROP_TOLERANCE off the grid
+    is refused, since it names no beat."""
+    from music import grid_beat, on_grid
+    requested = float(edit.get('drop', track['drop']))
+    if not 0 <= requested < float(track['duration']):
+        raise ValueError(f'drop {requested:.3f} s is outside the track (0-{float(track["duration"]):.2f} s).')
+    used, offset = on_grid(track, requested)
+    if 'drop' in edit and abs(offset) > EDIT_DROP_TOLERANCE:
+        beat, _ = grid_beat(track, requested)
+        period = 60/float(track['bpm'])
+        raise ValueError(f'drop {requested:.3f} s is {offset*1000:+.0f} ms off the track\'s beat grid; use a beat '
+                         f'such as {beat:.3f} s or {beat+(period if offset > 0 else -period):.3f} s, or one of '
+                         f'the drop_candidates.')
+    return used, offset
+
+
+def shot_beats(edit, beats_per_cut):
+    """Length of every montage shot in beats: its own `beats`, else `slots` x cut_beats."""
+    return [float(s['beats']) if 'beats' in s else int(s.get('slots', 1))*beats_per_cut for s in edit['montage']]
+
+
+def min_shot_beats(period):
+    """Fewest beats, in halves, that keep a shot at MIN_SHOT_FRAMES or more frames."""
+    return math.ceil(MIN_SHOT_FRAMES/(period*FPS)*2-1e-9)/2
 
 
 def timeline(clip, edit, word, track, settings):
@@ -109,28 +144,41 @@ def timeline(clip, edit, word, track, settings):
         raise ValueError(f'cut_beats must be one of {", ".join(map(str, CUT_BEATS))}.')
     interval = beats*period
     shots = edit['montage']
-    slots = [int(s.get('slots', 1)) for s in shots]
-    total = sum(slots)
-    montage = total*interval
+    lengths = shot_beats(edit, beats)
+    total = sum(lengths)
+    montage = total*period
     m_low, m_high = settings['montage_seconds_range']
     if not m_low-1e-6 <= montage <= m_high+1e-6:
+        if any('beats' in s for s in shots):
+            fewest, most = math.ceil(m_low/period*2-1e-6)/2, math.floor(m_high/period*2+1e-6)/2
+            raise ValueError(f'the montage lasts {montage:.2f} s ({total:g} beats of {period:.3f} s); it must last '
+                             f'{m_low:g}-{m_high:g} s, so give the shots {fewest:g}-{most:g} beats in total.')
+        slots = total/beats
         fewest, most = math.ceil(m_low/interval-1e-6), math.floor(m_high/interval+1e-6)
-        raise ValueError(f'the montage lasts {montage:.2f} s ({total} slots of {interval:.3f} s); it must last '
+        raise ValueError(f'the montage lasts {montage:.2f} s ({slots:g} slots of {interval:.3f} s); it must last '
                          f'{m_low:g}-{m_high:g} s, so use {fewest}-{most} slots.')
-    bounds = [0]
-    for s in slots:
-        bounds.append(bounds[-1]+s)
-    cuts = [drop_frame+round(b*interval*FPS) for b in bounds]
+    bounds = [0.0]
+    for length in lengths:
+        bounds.append(bounds[-1]+length)
+    # Cuts come from absolute beat times, so rounding to frames never adds up.
+    cuts = [drop_frame+round(b*period*FPS) for b in bounds]
     frames = [b-a for a, b in zip(cuts[:-1], cuts[1:])]
-    if min(frames) < 6:
-        raise ValueError(f'a montage shot would last {min(frames)} frames; use cut_beats {beats*2:g} or more.')
+    if min(frames) < MIN_SHOT_FRAMES:
+        n = frames.index(min(frames))+1
+        fewest = min_shot_beats(period)
+        unit = 'beat' if fewest == 1 else 'beats'
+        hint = (f'give it {fewest:g} {unit} or more' if 'beats' in shots[n-1]
+                else f'use cut_beats {next((b for b in CUT_BEATS if b >= fewest), CUT_BEATS[-1]):g} or more')
+        raise ValueError(f'montage shot {n} would last {min(frames)} frames (minimum {MIN_SHOT_FRAMES}); at '
+                         f'{60/period:.1f} BPM a shot needs at least {fewest:g} {unit}, so {hint}.')
     fx = effects(edit, settings)
     tail = round(fx.get('tail_seconds', settings['tail_seconds'])*FPS)
     total_frames = cuts[-1]+tail
     drop_at = drop_frame/FPS
     word_end -= head/FPS
-    track_start = float(track['drop'])-drop_at          # track time at edit time 0 (negative: music starts later)
-    needed = float(track['drop'])+(total_frames-drop_frame)/FPS
+    drop_time, drop_offset = track_drop(track, edit)
+    track_start = drop_time-drop_at          # track time at edit time 0 (negative: music starts later)
+    needed = drop_time+(total_frames-drop_frame)/FPS
     if needed > float(track['duration'])+1e-6:
         raise ValueError(f'the track ends {needed-float(track["duration"]):.2f} s too early after its drop; '
                          f'shorten the montage or pick another track.')
@@ -140,7 +188,31 @@ def timeline(clip, edit, word, track, settings):
             'beat': round(period, 6), 'cut_beats': beats, 'interval': round(interval, 6),
             'cut_frames': cuts, 'shot_frames': frames, 'tail_frames': tail, 'total_frames': total_frames,
             'montage_seconds': round((cuts[-1]-drop_frame)/FPS, 6), 'track_start': round(track_start, 6),
-            'music_delay': round(max(0.0, -track_start), 6), 'track_from': round(max(0.0, track_start), 6)}
+            'music_delay': round(max(0.0, -track_start), 6), 'track_from': round(max(0.0, track_start), 6),
+            'shot_beats': lengths, 'montage_beats': total, 'track_drop': round(drop_time, 6),
+            'drop_offset': round(drop_offset, 6)}
+
+
+def timeline_warnings(edit, plan_t, track=None, track_name=''):
+    """Things the agent must answer but that do not stop the render: a montage that does not
+    end on a bar line (silenced by the edit's `bar_note`) and a sidecar drop off its grid."""
+    from music import drop_grid_warning
+    warnings = []
+    beats = plan_t.get('montage_beats', 0)
+    if beats % BAR_BEATS and not str(edit.get('bar_note', '')).strip():
+        before, after = beats-beats % BAR_BEATS, beats-beats % BAR_BEATS+BAR_BEATS
+        warnings.append(f'the montage lasts {beats:g} beats, which does not end on a bar line (bars of {BAR_BEATS} '
+                        f'beats, counted from the drop as a downbeat); make it {before:g} or {after:g} beats, '
+                        f'or answer with "bar_note" why it should end mid-bar.')
+    if track is not None and 'drop' not in edit:
+        warning = drop_grid_warning(track_name or edit.get('track', 'track'), track)
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def structure_problems(plan, duration, settings):
@@ -175,6 +247,10 @@ def structure_problems(plan, duration, settings):
             problems.append(f'{label}: effects must be one of {", ".join(settings["effects"])}.')
         if edit.get('transition', 'cut') not in settings['transitions']:
             problems.append(f'{label}: transition must be one of {", ".join(settings["transitions"])}.')
+        if 'drop' in edit and not (_is_number(edit['drop']) and edit['drop'] >= 0):
+            problems.append(f'{label}: "drop" must be a time in the track in seconds (one of its drop_candidates).')
+        if 'bar_note' in edit and not (isinstance(edit['bar_note'], str) and edit['bar_note'].strip()):
+            problems.append(f'{label}: "bar_note" must say why the montage ends mid-bar.')
         shots = edit.get('montage')
         if not isinstance(shots, list) or not shots:
             problems.append(f'{label}: "montage" must list at least one shot.')
@@ -195,13 +271,49 @@ def structure_problems(plan, duration, settings):
                 problems.append(f'{label}, shot {n}: flash must be white, black or none.')
             if not (isinstance(shot.get('slots', 1), int) and shot.get('slots', 1) >= 1):
                 problems.append(f'{label}, shot {n}: slots must be a whole number of 1 or more.')
+            if 'beats' in shot:
+                value = shot['beats']
+                if not (_is_number(value) and value > 0 and float(value*2).is_integer()):
+                    problems.append(f'{label}, shot {n}: beats must be a positive number of whole or half beats '
+                                    f'(0.5, 1, 1.5, 2, ...).')
+                if 'slots' in shot:
+                    problems.append(f'{label}, shot {n}: give either beats or slots, not both.')
             if is_copper:
                 problems.extend(f'{label}, shot {n}: {p}' for p in copper.shot_problems(shot, n-1))
     return problems
 
 
-def edit_problems(plan, duration, transcript, music_folder=None, settings=None):
-    """Every problem with the plan's edits that can be found without rendering."""
+def default_edits_folder(plan):
+    """`<profile>/edits/` of the plan's output, or None when it cannot be named."""
+    try:
+        from shorts import output_folder, settings as video_settings
+        return edits_folder(output_folder(plan, video_settings()))
+    except (KeyError, OSError, ValueError, TypeError):
+        return None
+
+
+def locked_edit(plan, key, edit, folder=None):
+    """The stored info of an approved edit whose finished files are all in place, else None.
+    Such an edit is kept as it is, so it needs neither its track nor its timeline."""
+    if not edit.get('approved'):
+        return None
+    clip = next((c for c in plan.get('clips', []) if c.get('id') == key), None)
+    folder = folder or default_edits_folder(plan)
+    if clip is None or folder is None:
+        return None
+    from shorts import clip_stem
+    paths = edit_paths(Path(folder), clip_stem(clip))
+    if not all(paths[k].exists() for k in ('music', 'nomusic', 'info', 'done')):
+        return None
+    try:
+        return json.loads(paths['info'].read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+
+
+def edit_problems(plan, duration, transcript, music_folder=None, settings=None, folder=None):
+    """Every problem with the plan's edits that can be found without rendering. `folder` is
+    the output's edits folder (default: the plan's), where approved edits are looked up."""
     from music import load_track
     settings = settings or edit_settings()
     problems = structure_problems(plan, duration, settings)
@@ -212,6 +324,8 @@ def edit_problems(plan, duration, transcript, music_folder=None, settings=None):
     for key, edit in plan['edits'].items():
         clip = clips[key]
         label = f'Edit {key}'
+        if locked_edit(plan, key, edit, folder):
+            continue
         try:
             _, track = load_track(edit['track'], music_folder)
         except ValueError as exc:
@@ -280,6 +394,76 @@ def montage_framing(source, edit, plan_t, cache, config, transcript):
             values = sorted(f['center_x'] for f in framing['frames'])
             centers.append(round(values[len(values)//2], 4))
     return centers, problems
+
+
+def motion_changes(source, shot, index, frames, center, size, config, edit):
+    """Mean grey change from the previous frame (0..1, frame 0 gets 0) over the cropped
+    source window a montage shot reads, on the 30 fps grid."""
+    import numpy as np
+    import subprocess
+    seconds = shot_source_seconds(edit, shot, index, frames)
+    x = crop_x(center, size['scaled_width'], config['width'])
+    vf = f'fps={FPS},{crop_filter(size, x, config)},scale=72:90,format=gray'
+    result = subprocess.run(['ffmpeg', '-v', 'error', '-ss', f'{shot["start"]:.6f}', '-t', f'{seconds:.6f}',
+                             '-i', str(source), '-vf', vf, '-f', 'rawvideo', '-'], capture_output=True)
+    if result.returncode or not result.stdout:
+        return np.zeros(0)
+    gray = np.frombuffer(result.stdout, np.uint8).reshape(-1, 90, 72).astype(np.float32)
+    changes = np.zeros(len(gray))
+    changes[1:] = np.abs(np.diff(gray, axis=0)).mean(axis=(1, 2))/255
+    return changes
+
+
+def motion_peak(changes, shot, k, frames, plan_t, edit):
+    """Where the strongest motion of a shot's source window falls in the edit, and the
+    `start` values that would put it on the cut, on the next beat inside the shot, or (for a
+    Copper ramp) on the slowest part of the ramp. None without a usable window."""
+    import numpy as np
+    if len(changes) < 3:
+        return None
+    smooth = np.convolve(changes, np.ones(3)/3, mode='same')
+    smooth[0] = 0
+    i = int(np.argmax(smooth[1:]))+1
+    i = max(1, min(len(changes)-1, i-1+int(np.argmax(changes[i-1:i+2]))))  # the frame the change lands on
+    floor = float(np.median(changes[1:]))
+    peak_time = float(shot['start'])+i/FPS
+    ramp = edit.get('effects') == 'copper' and copper.motion(shot, k) == 'ramp'
+    offsets = copper.ramp_times(frames) if ramp else np.arange(frames)/FPS  # source offset per output frame
+    frame = int(np.argmin(np.abs(offsets-i/FPS)))
+    info = {'shot': k+1, 'peak': round(peak_time, 3), 'frame': frame, 'frames': frames,
+            'strength': round(float(changes[i]), 4), 'clear': bool(changes[i] >= max(.01, 2*floor)),
+            'to_cut': round(peak_time, 2)}
+    beats = plan_t.get('shot_beats')
+    if beats:
+        a, b = sum(beats[:k]), sum(beats[:k+1])
+        nxt = math.floor(a+1e-9)+1
+        if nxt < b-1e-9:
+            beat_frame = plan_t['drop_frame']+round(nxt*plan_t['beat']*FPS)-plan_t['cut_frames'][k]
+            info.update(beat_frame=beat_frame, to_beat=round(peak_time-float(offsets[beat_frame]), 2))
+    if ramp:
+        slow = int(np.argmin(np.diff(offsets)))
+        info.update(slow_frame=slow, to_slow=round(peak_time-float(offsets[slow]), 2))
+    return info
+
+
+def describe_motion(m):
+    text = (f'shot {m["shot"]}: strongest motion at {m["peak"]:.2f} s shows on frame {m["frame"]} of {m["frames"]}'
+            + ('' if m['clear'] else ' (no clear motion: the change barely rises above the rest)')
+            + f'; to put it on the cut, "start": {m["to_cut"]:.2f}')
+    if 'beat_frame' in m:
+        text += f'; on the beat at frame {m["beat_frame"]}, "start": {m["to_beat"]:.2f}'
+    if 'slow_frame' in m:
+        text += f'; in the slowest part of the ramp (frame {m["slow_frame"]}), "start": {m["to_slow"]:.2f}'
+    return text
+
+
+def montage_motion(ctx, config):
+    """motion_peak for every montage shot of an EditContext."""
+    result = []
+    for k, (shot, frames, center) in enumerate(zip(ctx.edit['montage'], ctx.plan_t['shot_frames'], ctx.centers)):
+        changes = motion_changes(ctx.source, shot, k, frames, center, ctx.size, config, ctx.edit)
+        result.append(motion_peak(changes, shot, k, frames, ctx.plan_t, ctx.edit))
+    return result
 
 
 def crop_x(center, scaled_width, width):
@@ -533,7 +717,8 @@ def music_graph(plan_t, edit, settings, gains, music_input):
     bed = 10**(bed_db/20)
     ramp = .03
     fade_in = min(settings['music_fade_in_seconds'], max(.01, drop-delay))
-    fade_out = settings['music_fade_out_seconds']
+    # The music fades over the black tail only: the last shot ends at full level.
+    fade_out = min(settings['music_fade_out_seconds'], max(.01, plan_t['tail_frames']/FPS))
     duck = settings['duck']
     length = total-delay
     music = (f'[{music_input}:a]aformat=sample_rates=48000:channel_layouts=stereo,atrim=duration={length:.6f},'
@@ -578,7 +763,7 @@ def edit_signature(edit, clip_signature, track_path, track, centers, config, set
         settings = {**settings, 'effects': {k: v for k, v in settings['effects'].items() if k != 'copper'}}
     return hashlib.sha256(json.dumps({
         'edit': {k: v for k, v in edit.items() if k not in NON_RENDER_KEYS}, 'clip': clip_signature,
-        'timeline': plan_t,
+        'timeline': {k: v for k, v in plan_t.items() if k not in TIMELINE_INFO_KEYS},
         'track': file_hash(track_path), 'timing': {k: track[k] for k in ('bpm', 'drop', 'duration')},
         'centers': centers, 'size': [config['width'], config['height']], 'settings': settings,
         'version': COPPER_VERSION if is_copper else EDIT_VERSION}, sort_keys=True).encode()).hexdigest()
@@ -689,10 +874,12 @@ def drop_gain(path, plan_t, rate=48000):
 
 # ----- previews and rendering -----
 
-def montage_sheet(source, edit, plan_t, centers, size, config, settings, dest: Path, title=''):
-    """One graded, cropped frame from the middle of each montage shot, with the look as rendered."""
+def montage_sheet(source, edit, plan_t, centers, size, config, settings, dest: Path, title='', motions=None):
+    """One graded, cropped frame from the middle of each montage shot, with the look as rendered.
+    `motions` (montage_motion) adds the frame where each shot's motion peaks."""
+    motions = motions or [None]*len(centers)
     if edit.get('effects') == 'copper':
-        return copper_montage_sheet(source, edit, plan_t, centers, size, config, settings, dest, title)
+        return copper_montage_sheet(source, edit, plan_t, centers, size, config, settings, dest, title, motions)
     from PIL import Image, ImageDraw, ImageFont
     from shorts import ROOT, run
     import tempfile
@@ -716,15 +903,18 @@ def montage_sheet(source, edit, plan_t, centers, size, config, settings, dest: P
                  '-filter_complex', f'[0:v]{pre}{look},scale={tile_w}:{tile_h}[o]', '-map', '[o]', '-update', '1', out])
             col, row = k % cols, k//cols
             sheet.paste(Image.open(out), (col*tile_w, 32+row*(tile_h+28)))
-            draw.text((col*tile_w+6, 32+row*(tile_h+28)+tile_h+2), f'{k+1}: {shot["start"]:.2f}s {frames}f',
+            peak = f' peak f{motions[k]["frame"]}' if motions[k] and motions[k]['clear'] else ''
+            draw.text((col*tile_w+6, 32+row*(tile_h+28)+tile_h+2), f'{k+1}: {shot["start"]:.2f}s {frames}f{peak}',
                       font=font, fill='white')
     dest.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(dest, quality=90)
     return dest
 
 
-def copper_montage_sheet(source, edit, plan_t, centers, size, config, settings, dest, title):
-    """The first, effect and last frames of each shot through the same graph as export."""
+def copper_montage_sheet(source, edit, plan_t, centers, size, config, settings, dest, title, motions=None):
+    """The first, effect and last frames of each shot through the same graph as export. On a
+    shot without a push the middle tile is the frame where its motion peaks, when there is one."""
+    motions = motions or [None]*len(centers)
     import subprocess
     import tempfile
     import numpy as np
@@ -737,7 +927,13 @@ def copper_montage_sheet(source, edit, plan_t, centers, size, config, settings, 
             seconds = shot_source_seconds(edit, shot, k, count)
             levels = measure_levels(source, [shot['start']+seconds/2], pre, settings)
             graph = montage_filter(0, 'shot', k, plan_t, center, size, config, edit, settings, levels, staged)
-            active = min(count-2, 5) if copper.motion(shot, k) == 'push' else count//2
+            peak = motions[k] if motions[k] and motions[k]['clear'] and 0 < motions[k]['frame'] < count-1 else None
+            if copper.motion(shot, k) == 'push':
+                active, middle = min(count-2, 5), 'motion'
+            elif peak:
+                active, middle = peak['frame'], f'peak f{peak["frame"]}'
+            else:
+                active, middle = count//2, 'motion'
             picks = (0, active, count-1)
             select = '+'.join(f'eq(n,{n})' for n in picks)
             graph += f";[shot]select='{select}',scale=216:270[out]"
@@ -748,7 +944,7 @@ def copper_montage_sheet(source, edit, plan_t, centers, size, config, settings, 
             if len(frames) != len(picks):
                 raise ValueError(f'Copper shot {k+1} could not produce all preview frames.')
             images.extend((frame, f'Shot {k+1} | {name} | {shot["start"]:.2f}s')
-                          for frame, name in zip(frames, ('entry', 'motion', 'exit')))
+                          for frame, name in zip(frames, ('entry', middle, 'exit')))
     return frame_sheet(images, dest, title, 3)
 
 
@@ -800,6 +996,9 @@ class EditContext:
             raise ValueError(f'Edit {clip["id"]}: no word has index {edit["payoff_word"]}.')
         self.word = word
         self.plan_t = timeline(clip, edit, word, self.track, settings)
+        self.warnings = timeline_warnings(edit, self.plan_t, self.track, self.track_path.name)
+        # From here on the track carries the drop the edit actually uses (a beat of its grid).
+        self.track = {**self.track, 'drop': self.plan_t['track_drop']}
         stream = next(s for s in probe(source)['streams'] if s['codec_type'] == 'video')
         self.size = geometry(stream, config)
         self.centers, self.problems = montage_framing(source, edit, self.plan_t, cache, config, transcript)
@@ -897,6 +1096,8 @@ def render_edit(ctx: EditContext, clip_mp4: Path, folder: Path, stem, config, se
             'effects': ctx.edit.get('effects', 'soft'), 'levels': levels,
             'payoff_word': ctx.edit['payoff_word'], 'payoff_text': ctx.word['word'].strip(),
             'centers': ctx.centers, 'timeline': plan_t, 'checks': checks,
+            'warnings': list(getattr(ctx, 'warnings', [])),
+            **({'bar_note': ctx.edit['bar_note']} if ctx.edit.get('bar_note') else {}),
             'music_hint': (f'In the app, start {ctx.track_path.name} at {max(0.0, plan_t["track_start"]):.2f} s'
                            + (f' and {plan_t["music_delay"]:.2f} s into the video' if plan_t['music_delay'] else '')
                            + f' so its drop lands on the cut at {plan_t["drop_at"]:.2f} s.')}
@@ -953,21 +1154,35 @@ def tidy_edits(folder: Path, keep_stems):
         print(f'Moved to edits/rejected/: {stem} (no longer in the plan)', flush=True)
 
 
-def contexts(source, plan, cache, config, transcript, settings, music_folder=None):
-    """(clip id, EditContext or the ValueError that stopped it) per edit, so one bad edit
-    never stops the others."""
+def contexts(source, plan, cache, config, transcript, settings, music_folder=None, folder=None):
+    """(clip id, EditContext, the stored info of a locked edit, or the ValueError that
+    stopped it) per edit, so one bad edit never stops the others. An approved edit whose
+    files are in place is not resolved again: it needs neither its track nor the analysis."""
     clips = {c['id']: c for c in plan['clips']}
     for key, edit in (plan.get('edits') or {}).items():
         try:
             if key not in clips:
                 raise ValueError(f'there is no clip {key} in the plan.')
+            locked = locked_edit(plan, key, edit, folder)
+            if locked is not None:
+                yield key, locked
+                continue
             yield key, EditContext(source, plan, clips[key], edit, cache, config, transcript, settings, music_folder)
         except ValueError as exc:
             yield key, exc
 
 
-def preview_edits(source, plan, cache, config, transcript, settings=None, music_folder=None):
-    """Montage sheets for review before rendering; returns (sheets, problems)."""
+def rhythm_label(plan_t):
+    """'cut every 0.580 s' for an even montage, else its beat pattern."""
+    beats = plan_t.get('shot_beats') or []
+    if len(set(beats)) <= 1 or all(b == plan_t['cut_beats'] for b in beats[:-1]):
+        return f'cut every {plan_t["interval"]:.3f} s'
+    return 'beats '+','.join(f'{b:g}' for b in beats)
+
+
+def preview_edits(source, plan, cache, config, transcript, settings=None, music_folder=None, out=print):
+    """Montage sheets for review before rendering; returns (sheets, problems). Prints the
+    warnings the agent must answer and where each shot's motion peaks."""
     from shorts import ROOT, clip_stem
     settings = settings or edit_settings()
     sheets, problems = [], []
@@ -975,13 +1190,24 @@ def preview_edits(source, plan, cache, config, transcript, settings=None, music_
         if isinstance(ctx, ValueError):
             problems.append(f'Edit {key}: {ctx}')
             continue
+        if isinstance(ctx, dict):
+            out(f'Edit {key}: approved and locked ({ctx.get("file", "files in place")}); not previewed.')
+            continue
         problems += [f'Edit {key}: {p}' for p in ctx.problems]
+        for warning in ctx.warnings:
+            out(f'Warning, edit {key}: {warning}')
         if ctx.problems and ctx.edit.get('effects') == 'copper':
             continue
+        motions = montage_motion(ctx, config)
+        out(f'Edit {key} motion (frame difference of each source window, as cropped):')
+        for m in motions:
+            if m:
+                out('    '+describe_motion(m))
         dest = ROOT/'Review'/plan['source_id']/'edits'/f'{clip_stem(ctx.clip)}-montage.jpg'
-        title = (f'Edit {key} | {ctx.track_path.name} {ctx.track["bpm"]:.1f} BPM | cut every {ctx.plan_t["interval"]:.3f} s '
+        title = (f'Edit {key} | {ctx.track_path.name} {ctx.track["bpm"]:.1f} BPM | {rhythm_label(ctx.plan_t)} '
                  f'| {ctx.edit.get("grade", "none")} | {ctx.edit.get("transition", "cut")}')
-        sheets.append(montage_sheet(source, ctx.edit, ctx.plan_t, ctx.centers, ctx.size, config, settings, dest, title))
+        sheets.append(montage_sheet(source, ctx.edit, ctx.plan_t, ctx.centers, ctx.size, config, settings, dest, title,
+                                    motions))
     return sheets, problems
 
 
@@ -1002,12 +1228,22 @@ def render_edits(source, plan, cache, config, output: Path, transcript, force=Fa
     qa.mkdir(parents=True, exist_ok=True)
     for old in qa.glob('*.jpg'):
         old.unlink()
-    for key, ctx in contexts(source, plan, cache, config, transcript, settings, music_folder):
+    for key, ctx in contexts(source, plan, cache, config, transcript, settings, music_folder, folder):
         if isinstance(ctx, ValueError):
             failures.append(f'Edit {key}: {ctx}')
             continue
+        if isinstance(ctx, dict):
+            # Approved with its files in place: kept as it is, even if its track is gone.
+            print(f'Approved and locked: {ctx["file"]}', flush=True)
+            sheets.append(qa_sheet(folder/ctx['file'], ctx['timeline'], qa/f'edit-{key}.jpg',
+                                   f'Edit {key} | {ctx["track"]} | drop {ctx["timeline"]["drop_at"]:.2f} s',
+                                   detailed=ctx.get('effects') == 'copper'))
+            index.append(ctx)
+            continue
         stem = clip_stem(ctx.clip)
         print(f'Edit [{key}]: {ctx.clip["title"]} with {ctx.track_path.name}', flush=True)
+        for warning in ctx.warnings:
+            print(f'Warning, edit {key}: {warning}', flush=True)
         try:
             info = render_edit(ctx, output/(stem+'.mp4'), folder, stem, config, settings, force,
                                out=lambda text: print(text, flush=True))

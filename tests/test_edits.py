@@ -90,6 +90,222 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(0, early['track_from'])
 
 
+class GridAndDropTests(unittest.TestCase):
+    def test_the_drop_is_the_grid_beat_nearest_the_sidecar_drop(self):
+        on = edits.timeline(CLIP, edit(), WORD, TRACK, SETTINGS)
+        # The user moved the drop 40 ms off the grid: the cuts stay on the beats of first_beat + k x beat.
+        moved = edits.timeline(CLIP, edit(), WORD, {**TRACK, 'drop': 30.04}, SETTINGS)
+        self.assertEqual(30.0, moved['track_drop'])
+        self.assertAlmostEqual(.04, moved['drop_offset'], places=6)
+        self.assertEqual(on['track_start'], moved['track_start'])
+        # Correcting first_beat moves the drop with the grid.
+        shifted = edits.timeline(CLIP, edit(), WORD, {**TRACK, 'first_beat': .1}, SETTINGS)
+        self.assertAlmostEqual(30.1, shifted['track_drop'], places=6)
+        self.assertAlmostEqual(30.1, shifted['track_start']+shifted['drop_at'], places=6)
+        warnings = edits.timeline_warnings(edit(), moved, {**TRACK, 'drop': 30.04}, 'song.mp3')
+        self.assertTrue(any('+40 ms off the beat grid' in w for w in warnings), warnings)
+
+    def test_millisecond_rounding_keeps_existing_edits_frame_identical(self):
+        # The user's track: first_beat 0.0012 + 32 beats = 18.5752 s against a drop of 18.575 s.
+        track = {'bpm': 103.37, 'first_beat': .0012, 'drop': 18.575, 'duration': 120.0}
+        t = edits.timeline(CLIP, edit(shots=9), WORD, track, SETTINGS)
+        self.assertEqual(18.575, t['track_drop'])
+        self.assertAlmostEqual(18.575-t['drop_at'], t['track_start'], places=6)
+        self.assertEqual([], edits.timeline_warnings({**edit(shots=9), 'bar_note': 'test'}, t, track))
+
+    def test_an_edit_can_use_another_drop_of_its_track(self):
+        t = edits.timeline(CLIP, edit(drop=60.0), WORD, TRACK, SETTINGS)
+        self.assertEqual(60.0, t['track_drop'])
+        self.assertAlmostEqual(60.0, t['track_start']+t['drop_at'], places=6)
+        # A few ms of rounding snap onto the beat; a time between beats is refused.
+        self.assertEqual(60.0, edits.timeline(CLIP, edit(drop=60.008), WORD, TRACK, SETTINGS)['track_drop'])
+        with self.assertRaisesRegex(ValueError, r"off the track's beat grid; use a beat such as 60\.000 s"):
+            edits.timeline(CLIP, edit(drop=60.2), WORD, TRACK, SETTINGS)
+        with self.assertRaisesRegex(ValueError, 'outside the track'):
+            edits.timeline(CLIP, edit(drop=95.0), WORD, TRACK, SETTINGS)
+        with self.assertRaisesRegex(ValueError, 'too early'):
+            edits.timeline(CLIP, edit(drop=86.0), WORD, TRACK, SETTINGS)
+        problems = edits.structure_problems({'clips': [CLIP], 'edits': {'03': edit(drop='late')}}, 600, SETTINGS)
+        self.assertTrue(any('"drop" must be' in p for p in problems), problems)
+
+
+class RhythmTests(unittest.TestCase):
+    PATTERN = [2, 2, 1, 1, .5, .5, .5, .5, 4]
+
+    def pattern_edit(self, pattern, **extra):
+        e = edit(shots=len(pattern), **extra)
+        for shot, beats in zip(e['montage'], pattern):
+            shot['beats'] = beats
+        return e
+
+    def test_shot_lengths_follow_a_beat_pattern_on_absolute_beat_times(self):
+        track = {**TRACK, 'bpm': 103.37}
+        t = edits.timeline(CLIP, self.pattern_edit(self.PATTERN), WORD, track, SETTINGS)
+        period = 60/103.37
+        bounds = np.cumsum([0]+self.PATTERN)
+        self.assertEqual([t['drop_frame']+round(b*period*30) for b in bounds], t['cut_frames'])
+        self.assertEqual(self.PATTERN, t['shot_beats'])
+        self.assertEqual(12, t['montage_beats'])
+        self.assertEqual([35, 35, 17, 17, 9, 9, 9, 8, 70], t['shot_frames'])
+        self.assertEqual([], edits.timeline_warnings(self.pattern_edit(self.PATTERN), t))
+
+    def test_slots_still_work_and_mix_with_beats(self):
+        legacy = edit(shots=8)
+        legacy['montage'][-1]['slots'] = 2
+        mixed = edit(shots=8)
+        mixed['montage'][-1]['beats'] = 2
+        a = edits.timeline(CLIP, legacy, WORD, TRACK, SETTINGS)
+        b = edits.timeline(CLIP, mixed, WORD, TRACK, SETTINGS)
+        self.assertEqual(a['cut_frames'], b['cut_frames'])
+
+    def test_a_montage_ending_mid_bar_warns_until_the_agent_answers(self):
+        t = edits.timeline(CLIP, self.pattern_edit([2, 2, 1, 1, 1, 1, 3]), WORD, TRACK, SETTINGS)
+        self.assertEqual(11, t['montage_beats'])
+        warnings = edits.timeline_warnings(self.pattern_edit([2, 2, 1, 1, 1, 1, 3]), t)
+        self.assertEqual(1, len(warnings))
+        self.assertIn('make it 8 or 12 beats', warnings[0])
+        answered = self.pattern_edit([2, 2, 1, 1, 1, 1, 3], bar_note='Ends on the slam, mid-bar on purpose.')
+        self.assertEqual([], edits.timeline_warnings(answered, t))
+
+    def test_mid_bar_is_a_warning_not_a_problem(self):
+        from unittest import mock
+        e = edit(shots=9, effects='copper')   # like the user's edits 17 and 23: 10 beats
+        e['montage'][-1]['slots'] = 2
+        plan = {'clips': [CLIP], 'edits': {'03': e}}
+        with mock.patch('music.load_track', return_value=(Path('song.mp3'), {**TRACK, 'bpm': 103.37})):
+            self.assertEqual([], edits.edit_problems(plan, 600, {'segments': [{'words': [WORD]}]}, settings=SETTINGS))
+
+    def test_shots_too_short_for_the_tempo_name_the_smallest_beat_value(self):
+        fast = {**TRACK, 'bpm': 188.8}
+        self.assertEqual(1, edits.min_shot_beats(60/188.8))
+        self.assertEqual(.5, edits.min_shot_beats(60/103.37))
+        e = self.pattern_edit([2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, .5, .5, 1])
+        with self.assertRaisesRegex(ValueError, r'montage shot 13 would last 4 frames .* at least 1 beat, so give it 1 beat or more'):
+            edits.timeline(CLIP, e, WORD, fast, SETTINGS)
+        with self.assertRaisesRegex(ValueError, r'give the shots 4-9 beats in total'):
+            edits.timeline(CLIP, self.pattern_edit([1, 1, 1]), WORD, {**TRACK, 'bpm': 60.0}, SETTINGS)
+
+    def test_beats_must_be_halves_and_not_combined_with_slots(self):
+        e = self.pattern_edit([2, .3, 0, 1])
+        e['montage'][3]['slots'] = 2
+        problems = ' '.join(edits.structure_problems({'clips': [CLIP], 'edits': {'03': e}}, 600, SETTINGS))
+        self.assertEqual(2, problems.count('whole or half beats'), problems)
+        self.assertIn('either beats or slots', problems)
+        empty_note = {**self.pattern_edit(self.PATTERN), 'bar_note': ' '}
+        self.assertIn('"bar_note" must say why', ' '.join(
+            edits.structure_problems({'clips': [CLIP], 'edits': {'03': empty_note}}, 600, SETTINGS)))
+
+
+class FadeTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
+    def test_the_music_holds_its_level_to_the_last_cut_and_fades_in_the_tail(self):
+        for profile, tail in (('copper', .3), ('soft', .8)):
+            with self.subTest(effects=profile):
+                e = edit(effects=profile)
+                t = edits.timeline(CLIP, e, WORD, TRACK, SETTINGS)
+                self.assertAlmostEqual(tail, t['tail_frames']/30, places=6)
+                pcm = subprocess.check_output(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'sine=r=48000:d=10',
+                                               '-f', 'lavfi', '-i', 'sine=f=110:r=48000:d=40',
+                                               '-filter_complex', edits.music_graph(t, e, SETTINGS, (-9, -6), 1),
+                                               '-map', '[a]', '-f', 'f32le', '-'])
+                audio = np.frombuffer(pcm, np.float32).reshape(-1, 2)[:, 0]
+                rate = 48000
+                last_cut = t['cut_frames'][-1]/30
+                level = lambda a, b: edits.rms_db(audio[int(a*rate):int(b*rate)])
+                steady = level(last_cut-1.0, last_cut-.5)
+                # The last shot ends at full level; the fade fits the tail and reaches silence.
+                self.assertAlmostEqual(steady, level(last_cut-.1, last_cut), delta=.2)
+                self.assertLess(level(last_cut+tail-.05, last_cut+tail), steady-15)
+
+
+class LockedEditTests(unittest.TestCase):
+    def locked_plan(self, tmp, files=True):
+        clip = {'id': '01', 'title': 'A', 'start': 0.0, 'end': 20.0}
+        plan = {'clips': [clip], 'edits': {'01': edit(track='gone.wav', approved={'at': 't0'})}}
+        folder = tmp/'out'/'edits'
+        folder.mkdir(parents=True)
+        info = {'id': '01', 'file': '01_A.edit.mp4', 'track': 'gone.wav', 'effects': 'copper',
+                'timeline': {'drop_frame': 10, 'drop_at': 10/30, 'cut_frames': [10, 20, 30], 'total_frames': 40}}
+        if files:
+            make_clip(folder/'01_A.edit.mp4', 40/30)
+            for name in ('01_A.edit-nomusic.mp4', '01_A.edit.done.json'):
+                (folder/name).write_text('{}', encoding='utf-8')
+            (folder/'01_A.edit.json').write_text(json.dumps(info), encoding='utf-8')
+        return plan, folder, info
+
+    def test_an_approved_edit_with_its_files_needs_no_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            plan, folder, info = self.locked_plan(tmp)
+            (tmp/'Music').mkdir()
+            self.assertEqual([], edits.edit_problems(plan, 600, {'segments': [{'words': [WORD]}]},
+                                                     music_folder=tmp/'Music', settings=SETTINGS, folder=folder))
+            self.assertEqual(info, edits.locked_edit(plan, '01', plan['edits']['01'], folder))
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
+    def test_render_keeps_the_locked_edit_and_its_index_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            plan, folder, info = self.locked_plan(tmp)
+            index = edits.render_edits(tmp/'source.mp4', plan, tmp/'cache', {}, tmp/'out', {'segments': []},
+                                       music_folder=tmp/'Music')
+            self.assertEqual([info], index)
+            self.assertTrue((folder/'01_A.edit.mp4').exists())
+            self.assertTrue((tmp/'cache'/'qa-current'/'edits'/'edit-01.jpg').exists())
+
+    def test_an_approved_edit_without_its_files_still_needs_its_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            plan, folder, _ = self.locked_plan(tmp, files=False)
+            (tmp/'Music').mkdir()
+            problems = edits.edit_problems(plan, 600, {'segments': [{'words': [WORD]}]},
+                                           music_folder=tmp/'Music', settings=SETTINGS, folder=folder)
+            self.assertEqual(1, len(problems), problems)
+            self.assertIn('Music track not found', problems[0])
+
+
+class MotionTests(unittest.TestCase):
+    def test_the_peak_maps_to_cut_beat_and_ramp_start_values(self):
+        t = edits.timeline(CLIP, edit(shots=6, cut_beats=2), WORD, TRACK, SETTINGS)   # 2 beats = 30 frames
+        changes = np.full(30, .01)
+        changes[12] = .2
+        shot = {'start': 50.0}
+        m = edits.motion_peak(changes, shot, 1, 30, t, edit())
+        self.assertEqual((12, True), (m['frame'], m['clear']))
+        self.assertEqual(50.4, m['to_cut'])
+        self.assertEqual(15, m['beat_frame'])               # the beat in the middle of a two-beat shot
+        self.assertEqual(round(50.4-15/30, 2), m['to_beat'])
+        self.assertNotIn('slow_frame', m)
+        # A one-beat shot has no beat inside it; a flat window has no clear peak.
+        one = edits.timeline(CLIP, edit(cut_beats=1), WORD, TRACK, SETTINGS)
+        self.assertNotIn('beat_frame', edits.motion_peak(changes[:15], shot, 0, 15, one, edit()))
+        self.assertFalse(edits.motion_peak(np.full(15, .01), shot, 0, 15, one, edit())['clear'])
+
+    def test_a_ramp_peak_is_placed_through_the_ramp_curve(self):
+        import copper
+        styled = edit(shots=6, cut_beats=2, effects='copper')
+        styled['montage'][1]['motion'] = 'ramp'
+        t = edits.timeline(CLIP, styled, WORD, TRACK, SETTINGS)
+        changes = np.full(32, .01)
+        changes[20] = .3
+        m = edits.motion_peak(changes, styled['montage'][1], 1, 30, t, styled)
+        offsets = copper.ramp_times(30)
+        self.assertEqual(int(np.argmin(np.abs(offsets-20/30))), m['frame'])
+        self.assertEqual(int(np.argmin(np.diff(offsets))), m['slow_frame'])
+        self.assertAlmostEqual(styled['montage'][1]['start']+20/30-offsets[m['slow_frame']], m['to_slow'], delta=.006)
+        self.assertIn('slowest part of the ramp', edits.describe_motion(m))
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
+    def test_the_change_is_measured_on_the_cropped_source_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)/'source.mp4'
+            make_source(source, 6)   # the brightness flips at 2 s and 4 s
+            size, config = {'scaled_width': 640, 'scaled_height': 360}, {'width': 288, 'height': 360}
+            changes = edits.motion_changes(source, {'start': 1.5}, 0, 30, .5, size, config, edit())
+        self.assertEqual(30, len(changes))
+        self.assertEqual(15, int(np.argmax(changes)))
+
+
 class StructureTests(unittest.TestCase):
     def test_reports_every_problem_at_once(self):
         plan = {'clips': [CLIP], 'edits': {
