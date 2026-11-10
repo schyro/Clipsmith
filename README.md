@@ -51,7 +51,7 @@ A plain `./run.cmd` with no options picks clips with a simple keyword heuristic.
 
 ![The Clipsmith clip editor](docs/images/clip-editor.png)
 
-`./run.cmd --review-gallery` opens the editor in its own window (`http://127.0.0.1:8765/editor/`). For each clip you can:
+`./run.cmd --review-gallery` opens the editor in its own window (`http://127.0.0.1:8765/editor/`). The agent's candidates come first, before anything is rendered: play each from a low-resolution preview with live captions, then keep it (K) or reject it (X, then a number for the reason). Apply renders only the kept ones. For each rendered clip you can:
 
 - approve it, reject it or ask for changes, with a comment or notes pinned to moments on the timeline
 - move the start and end (cuts snap to word boundaries)

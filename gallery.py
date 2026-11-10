@@ -1,8 +1,10 @@
 """Review decisions model and the read-only static gallery.
 
 `review-decisions.json` in an output profile folder holds the reviewer's
-decision per clip id: status, change options, comment, notes pinned to source
-times (`notes`), moved edges and staged framing (`focus_overrides`). The interactive editor (`editor_server.py`,
+decision per clip id: status, change options, comment, reject reasons, notes
+pinned to source times (`notes`), moved edges and staged framing (`focus_overrides`).
+Candidates that were never rendered are triaged in the same file: `kept` sends a
+clip to the next render, after which it is reviewed again from `pending`. The interactive editor (`editor_server.py`,
 started by `run --review-gallery`) writes it; `--apply-review` applies it.
 `index.html` is a read-only overview that also works when opened from disk.
 """
@@ -18,8 +20,13 @@ import threading
 from urllib.parse import quote, unquote
 
 DECISIONS_FILE = 'review-decisions.json'
-STATUSES = ('pending', 'approved', 'needs_changes', 'rejected')
-STATUS_LABELS = {'pending': 'Pending', 'approved': 'Approved', 'needs_changes': 'Needs changes', 'rejected': 'Rejected'}
+STATUSES = ('pending', 'kept', 'approved', 'needs_changes', 'rejected')
+STATUS_LABELS = {'pending': 'Pending', 'kept': 'Kept', 'approved': 'Approved', 'needs_changes': 'Needs changes',
+                 'rejected': 'Rejected'}
+# One-click reasons for rejecting a clip; they feed the preference record the agent reads.
+REJECT_REASONS = {'needs_context': 'Needs context', 'not_interesting': 'Not interesting', 'too_long': 'Too long',
+                  'weak_ending': 'Weak ending / no payoff', 'duplicate': 'Duplicate of another clip',
+                  'bad_cut': 'Bad cut (start or end)'}
 OPTIONS = ('recut', 'fix_framing')
 OPTION_LABELS = {'recut': 'Re-cut (start/end)', 'fix_framing': 'Fix framing'}
 MAX_COMMENT = 4000
@@ -154,14 +161,19 @@ def validate_update(update):
         if not _number(value) or abs(value) > MAX_SHIFT:
             raise ValueError(f'{name} must be a number of seconds.')
         shifts[name] = round(float(value), 3)
+    reasons = update.get('reasons', [])
+    if not isinstance(reasons, list) or any(r not in REJECT_REASONS for r in reasons):
+        raise ValueError(f'Reasons must be a subset of {list(REJECT_REASONS)}.')
     return {'status': status, 'options': [o for o in OPTIONS if o in options], 'comment': comment.strip(), **shifts,
             'focus_overrides': validate_overrides(update.get('focus_overrides')),
-            'notes': validate_notes(update.get('notes'))}
+            'notes': validate_notes(update.get('notes')),
+            # Reasons belong to a rejection; another status drops them.
+            'reasons': [r for r in REJECT_REASONS if r in reasons] if status == 'rejected' else []}
 
 
 def _stored(entry, key):
     """An entry field as validate_update would return it when absent."""
-    return entry.get(key, 0 if key.endswith('_shift') else [] if key == 'notes' else None)
+    return entry.get(key, 0 if key.endswith('_shift') else [] if key in ('notes', 'reasons') else None)
 
 
 def apply_decision(decisions, clip, update, timestamp=None):
@@ -177,8 +189,9 @@ def apply_decision(decisions, clip, update, timestamp=None):
         entry.pop('agent_note', None)
     if entry.get('focus_overrides') is None:
         entry.pop('focus_overrides', None)
-    if not entry.get('notes'):
-        entry.pop('notes', None)
+    for name in ('notes', 'reasons'):
+        if not entry.get(name):
+            entry.pop(name, None)
     decisions['clips'][key] = entry
     return entry
 
@@ -318,10 +331,11 @@ def write_gallery(output: Path, root: Path, clips=None, plan=None):
 
 
 def latest_output(root: Path):
-    folders = [p.parent for p in (Path(root)/'Output').glob('*/*/clips.json')]
-    if not folders:
-        raise ValueError('No rendered output folder with clips.json was found.')
-    return max(folders, key=lambda p: (p/'clips.json').stat().st_mtime)
+    """The output folder edited last: rendered (clips.json) or only triaged so far (decisions)."""
+    marks = list((Path(root)/'Output').glob('*/*/clips.json'))+list((Path(root)/'Output').glob(f'*/*/{DECISIONS_FILE}'))
+    if not marks:
+        raise ValueError('No output folder with clips.json or review decisions was found.')
+    return max(marks, key=lambda p: p.stat().st_mtime).parent
 
 
 def _resolve_inside(root: Path, url_path: str, allowed=('Output', 'Review')):

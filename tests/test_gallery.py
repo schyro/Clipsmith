@@ -22,7 +22,7 @@ class DecisionTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_update(bad)
         self.assertEqual({'status': 'needs_changes', 'options': ['recut', 'fix_framing'], 'comment': 'x',
-                          'start_shift': 0.0, 'end_shift': 0.0, 'focus_overrides': None, 'notes': []},
+                          'start_shift': 0.0, 'end_shift': 0.0, 'focus_overrides': None, 'notes': [], 'reasons': []},
                          validate_update({'status': 'needs_changes', 'options': ['fix_framing', 'recut'], 'comment': ' x '}))
         # Edges are not limited to a fixed distance; the editor server keeps them inside the source.
         self.assertEqual(95.5, validate_update({'start_shift': 95.5})['start_shift'])
