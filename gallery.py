@@ -69,6 +69,7 @@ def load_decisions(folder: Path):
 
 def save_decisions(folder: Path, data):
     path = Path(folder)/DECISIONS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name+'.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     os.replace(tmp, path)

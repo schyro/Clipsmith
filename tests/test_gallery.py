@@ -3,12 +3,22 @@ from pathlib import Path
 import tempfile
 import unittest
 from gallery import (DECISIONS_FILE, actionable, apply_decision, check_overrides_against_shots, empty_decisions,
-                     parse_range, render_page, save_decisions, validate_update, write_gallery, _resolve_inside)
+                     load_decisions, parse_range, render_page, save_decisions, validate_update, write_gallery,
+                     _resolve_inside)
 
 CLIP = {'id': '01', 'file': '01_A.mp4', 'title': 'A', 'start': 10.0, 'end': 40.0, 'reason': 'Setup and payoff.'}
 
 
 class DecisionTests(unittest.TestCase):
+    def test_first_rejection_saves_before_the_output_profile_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)/'source'/'profile'
+            decisions = empty_decisions({'source_id': 's'}, output.name)
+            candidate = {**CLIP, 'file': '', 'rendered': False}
+            apply_decision(decisions, candidate, {'status': 'rejected', 'reasons': ['too_long']})
+            save_decisions(output, decisions)
+            self.assertEqual(decisions, load_decisions(output))
+
     def test_validation_rejects_unknown_status_and_options(self):
         for bad in [{'status': 'maybe'}, {'options': ['fix_captions']}, {'options': 'recut'}, {'comment': 5}, [],
                     {'start_shift': float('inf')}, {'end_shift': '1'}, {'start_shift': True}, {'focus_overrides': {}},
