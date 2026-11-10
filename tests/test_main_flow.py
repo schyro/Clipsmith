@@ -9,7 +9,8 @@ from unittest import mock
 import shorts
 
 PLAN = {'source': 'a.mp4', 'source_id': 'sid', 'selection': 'agent-reviewed',
-        'clips': [{'id': '01', 'start': 10, 'end': 30, 'title': 't', 'reason': 'r'}],
+        # Kept in the editor's triage: a candidate nobody kept is not rendered.
+        'clips': [{'id': '01', 'start': 10, 'end': 30, 'title': 't', 'reason': 'r', 'kept': {'at': '2026-01-01'}}],
         'edits': {'01': {'track': 'missing.mp3', 'payoff_word': 1}}}
 
 
