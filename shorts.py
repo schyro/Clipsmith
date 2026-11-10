@@ -537,6 +537,9 @@ def load_plan(plan_path, fingerprint, duration):
 
 
 def main():
+    if '--shots' in sys.argv[1:]:  # shot index: its own options, see shot_index.py
+        import shot_index
+        return shot_index.main([a for a in sys.argv[1:] if a != '--shots'])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, help='Default: all videos in the Raw folder')
     parser.add_argument('--count', type=int, default=None, help='Optional proposal count limit; no fixed limit by default')
