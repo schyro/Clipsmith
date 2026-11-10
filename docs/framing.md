@@ -7,7 +7,7 @@ The video always fills 1080x1350. No zoom-out, letterboxing, padding or blurred 
 
 Both analysis and rendering use the same 30 fps frame grid. Camera cuts are checked on every frame, and face tracking/smoothing reset at a cut. Commands for frame N are scheduled between frames N-1 and N, preventing decimal timestamp rounding from shifting the crop one frame early. The old 8 fps estimates and cross-shot center changes are not used.
 
-Analysis runs in two stages. The slow stage (cached in `work/<id>/speaker-tracks-*.json`) finds exact cut frames, links YuNet detections into face tracks and scores every track with Light-ASD. Tracking follows the upstream Light-ASD demo: up to 10 missed detections are bridged, tracks shorter than 10 frames are ignored, and a track that breaks and restarts at the same place is stitched back together.
+Analysis runs in two stages. The slow stage works on the source's own frames and is cached per source: one scan finds every camera cut, and each camera shot a clip touches gets its YuNet detections linked into face tracks and scored with Light-ASD, once (`work/<id>/source-scan.npz` and `work/<id>/shots/`; see [shot-index.md](shot-index.md)). A clip's analysis is a slice of that cache on its 30 fps grid, so moving a clip edge re-analyses nothing unless it reaches a new shot. Tracking follows the upstream Light-ASD demo: up to 10 missed detections are bridged, tracks shorter than 10 frames are ignored (both counted in 30 fps frames and scaled to the source's frame rate), and a track that breaks and restarts at the same place is stitched back together.
 
 The fast stage chooses the followed face for each shot with dynamic programming over the whole shot, never past its cut:
 

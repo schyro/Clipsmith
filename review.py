@@ -26,6 +26,13 @@ def prepare_review(source, fingerprint, cache, transcript, duration, plan_path):
                 draw.text((x+12,y+276),f'{second//60:02}:{second%60:02} / {second}s',font=font,fill='white')
             canvas.save(sheet,quality=90)
         sheets.append(str(sheet))
+    # One scan of the whole source: camera cuts and faces, also reused by every render.
+    from shot_index import build_index, write_character_sheet
+    index, index_file = build_index(source, cache, fingerprint)
+    character_sheet = folder/'shots'/'characters.jpg'
+    if index['characters'] and not character_sheet.exists():
+        write_character_sheet(source, index, character_sheet)
+    character_sheet = character_sheet if character_sheet.exists() else None
     lines = [f'# {source.name}',f'Source ID: {fingerprint}',f'Duration: {duration:.3f} seconds',
              f'English word timestamps: {cache / ("transcript-"+transcript["model"]+("-english" if transcript.get("task")=="translate" else "")+".json")}',
              f'Plan destination: {plan_path}',
@@ -40,7 +47,12 @@ def prepare_review(source, fingerprint, cache, transcript, duration, plan_path):
              'Check boundaries against word timing and nearby frames; do not cut off setup, payoff or a spoken word.',
              'Framing always fills 4:5 without widening or padding. Local Light-ASD scores synchronized audio/face tracks. Review uncertain speaker choices and use focus_overrides with exact clip-relative start_frame/end_frame (30 fps), center_x and optional center_x_end. Never cross a camera cut or target an offscreen face early. Per-clip focus sidecars list exact cut frames.',
              f'Caption corrections: {cache/("caption-edits-"+transcript["model"]+".json")}. Schema: {{"model":"'+transcript['model']+'","edits":[{"index":0,"from":"original stripped word","to":"corrected word"}]}. Use each word\'s "index" from words.json: a number for transcript words, a "g" id for words the missed-speech pass found. Preserve word times.',
-             '', '## Contact sheets',*sheets,'','## Full English dialogue']
+             '', '## Contact sheets',*sheets,
+             '', '## Shot index', f'Every camera shot with its faces: {index_file}',
+             *([f'Who each character id is: {character_sheet}'] if character_sheet else []),
+             'Find montage shots and check who is on screen with `run --shots` (docs/shot-index.md), for example '
+             '`run --shots --character 1 --framing close-up --sharp --min-seconds 0.6 --sheet`.',
+             '','## Full English dialogue']
     from selection import block_label, block_start
     block = None
     for unit in sentences(transcript):
@@ -56,7 +68,8 @@ def prepare_review(source, fingerprint, cache, transcript, duration, plan_path):
     (folder/'words.json').write_text(json.dumps([{**w,'index':w.get('index',i)} for i,w in enumerate(words)],ensure_ascii=False,indent=2),encoding='utf-8')
     selection = json.loads(plan_path.read_text(encoding='utf-8-sig')).get('selection') if plan_path.exists() else None
     entry = {'source':str(source),'source_id':fingerprint,'duration':duration,'review':str(review_path),
-             'contact_sheets':sheets,'plan':str(plan_path),'selection':selection,
+             'contact_sheets':sheets,'shot_index':str(index_file),
+             'character_sheet':str(character_sheet) if character_sheet else None,'plan':str(plan_path),'selection':selection,
              'needs_editorial_review':selection not in ('editor-reviewed','agent-reviewed')}
     print(f'Review ready: {review_path}',flush=True)
     return entry

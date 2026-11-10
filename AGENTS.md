@@ -8,7 +8,7 @@ You, the agent in the chat, are the editor: you read the transcripts and pick th
 
 Carry the job through to verified MP4 files. A running process is not completion.
 
-1. **Prepare.** Run `run --prepare-review` and wait for it. `Review/manifest.json` lists, per source, the full dialogue (`review.md`), global word indices and times (`words.json`) and timestamped contact sheets.
+1. **Prepare.** Run `run --prepare-review` and wait for it. `Review/manifest.json` lists, per source, the full dialogue (`review.md`), global word indices and times (`words.json`), timestamped contact sheets and the shot index (`shot_index`, `character_sheet`; see Shot index below). The first run scans each source once for camera cuts and faces, a few minutes per hour of video.
 2. **Select.** For each entry that needs review, read the complete `review.md` and look at the contact sheets. You are building a pool of candidates for short-form social video (Shorts, Reels, TikTok). The user picks the winners, so when in doubt, include the moment. Do not ask the user for a clip count or length; the rules below are the default.
    - **What qualifies:** any moment that would make someone stop scrolling, watch to the end, replay it, comment on it or send it to a friend, for whatever reason. It must make sense to someone who has not seen the rest of the recording. Look for every kind:
      - *Funny:* jokes, banter, comebacks, sarcasm, comic timing, absurd or awkward situations, someone being caught out or put in their place.
@@ -76,7 +76,7 @@ Make edits when the user asks for them, or when `Music/` holds tracks while you 
    - `dialogue_start`: an edit runs about 20–30 s, so its dialogue lasts about 10–20 s. When the clip is longer, open the edit on the latest line that still sets up the payoff, in a gap between two words.
    - `effects`: use `"copper"` for new music edits unless the user requests another treatment. Existing plans keep their chosen profile. Copper uses restrained colour, a short music-bed dip before the drop, a four-frame hold at the end of the last shot, and a short black tail.
    - `transition`: use `"cut"` with Copper. Use a clear, immediately recognisable shot of the character on the first frame of the drop. Set `drop_delay` around 0.19–0.25 s when the end of the line leaves room. Leave `grade` unset for the Copper colour look; override it if the source or the user's requested tone calls for it.
-   - `montage`: pick distinct moments of the featured character from the same source, outside the clip. Verify the actual frames around promising contact-sheet times. Alternate readable close-ups, medium shots and meaningful motion. Aim for about 5–7 s of montage when the track and available shots support it. The last shot may hold `"slots": 2`. Each entry starts with `{"start": <source seconds>}`.
+   - `montage`: pick distinct moments of the featured character from the same source, outside the clip. Find them in the shot index, for example `run --shots --character 1 --framing close-up --sharp --min-seconds 0.6 --sheet`, and look at the sheet it writes; start each montage shot inside one listed camera shot. Alternate readable close-ups, medium shots and meaningful motion. Aim for about 5–7 s of montage when the track and available shots support it. The last shot may hold `"slots": 2`. Each entry starts with `{"start": <source seconds>}`.
    - **Copper shot directions.** Use the default eye-anchored push on the first shot when its framing has room. Use `"motion": "none"` if the first shot is already tight or the face is unsuitable for tracking. `center_x` sets the horizontal crop in source coordinates; `anchor: [x, y]` sets a manual push pivot in the cropped frame. Check that the face stays readable. Add `"motion": "ramp"` to one shot with a visible gesture or expression, and check that the action lands in the slower part. Adjust its source start if needed. Leave other shots on clean cuts unless a second push is motivated by the action. Use `"flash": "white"` on at most three separated accents after the drop. Use `practical_light: [x, y]` only where a real bright source is visible, and `"cool_background": true` only on shots whose vivid violet or blue distracts from the face. Choose a final pose that reads clearly during the short hold. Skip silhouette echoes and routine shake in this treatment.
    - `reason`.
 4. **Check.** Run `run --require-reviewed --analyze-only`. It lists every problem with the edits; a shot that crosses a camera cut comes with the times to move it to. A speed ramp can need more source footage than its beat slot. It also writes `Review/<id>/edits/<stem>-montage.jpg`. Review Copper's entry, motion and exit frames. Fix misplaced crops with `center_x` and adjust the push anchor or shot timing where needed.
@@ -87,6 +87,17 @@ Make edits when the user asks for them, or when `Music/` holds tracks while you 
    - the `music_hint` from `<stem>.edit.json`, which says where to start the track in an app.
 
 Edit defaults live in `edit_settings.json`. Treat them like `video_settings.json`: change them only when the user asks.
+
+## Shot index
+
+`Review/<id>/shot-index.json` lists every camera shot of a source: its time range and, per visible face, its size (`close-up`, `medium`, `wide`), position, sharpness and a `character` id shared by the same person across the source. `run --prepare-review` builds it; `run --shots` builds it on its own and prints the characters.
+
+- Look at `Review/<id>/shots/characters.jpg` first to learn which id is which person. Ids belong to one source.
+- Query with `run --shots` plus any of `--character N`, `--framing close-up|medium|wide`, `--sharp`, `--solo`, `--min-seconds S`, `--from S`, `--to S`. Add `--sheet` to get a contact sheet of the matches, each shown at the moment the face is clearest.
+- Use it to pick montage shots, to find a character's best close-ups and to check who is on screen in a shot you are framing.
+- A `character` of `null` means the face was too small or too rare to identify, or the identity model is not installed. Check such shots on a sheet.
+
+Details: `docs/shot-index.md`.
 
 ## Applying the user's review
 

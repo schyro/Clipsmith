@@ -156,7 +156,7 @@ def stitch_tracks(tracks, rate=1.0):
                 b = min(candidates)[2]
                 a['indices'] += b['indices']
                 a['boxes'] += b['boxes']
-                tracks.remove(b)
+                tracks = [t for t in tracks if t is not b]  # by identity: == would compare the boxes
                 merged = True
                 break
     return tracks
