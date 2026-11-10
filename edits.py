@@ -48,6 +48,10 @@ NON_RENDER_KEYS = {'reason', 'approved', 'bar_note'}
 # Timeline fields that only describe the edit; they stay out of the render signature so
 # adding them did not re-render existing edits.
 TIMELINE_INFO_KEYS = {'shot_beats', 'montage_beats', 'track_drop', 'drop_offset'}
+# Motion peaks: frame-to-frame grey change (0..1) of a shot's cropped source window.
+DUPLICATE_CHANGE = .002     # below this a frame repeats the previous one (film on the 30 fps grid)
+MOTION_MIN_CHANGE = .01     # a peak must change at least 1 % of the grey range
+MOTION_PEAK_RATIO = 1.5     # and rise this far above the window's typical change
 
 
 def edit_settings(root: Path | None = None):
@@ -419,19 +423,28 @@ def motion_peak(changes, shot, k, frames, plan_t, edit):
     `start` values that would put it on the cut, on the next beat inside the shot, or (for a
     Copper ramp) on the slowest part of the ramp. None without a usable window."""
     import numpy as np
-    if len(changes) < 3:
+    changes = np.asarray(changes, dtype=float)
+    # Film sources on the 30 fps grid repeat every fifth frame (zero change); those frames
+    # carry no information, so the peak and the level it must rise above skip them.
+    valid = changes > DUPLICATE_CHANGE
+    if len(valid):
+        valid[0] = False
+    if valid.sum() < 3:
         return None
-    smooth = np.convolve(changes, np.ones(3)/3, mode='same')
-    smooth[0] = 0
-    i = int(np.argmax(smooth[1:]))+1
-    i = max(1, min(len(changes)-1, i-1+int(np.argmax(changes[i-1:i+2]))))  # the frame the change lands on
-    floor = float(np.median(changes[1:]))
+    ones = np.ones(3)
+    smooth = np.where(valid, np.convolve(np.where(valid, changes, 0), ones, mode='same')
+                      / np.maximum(np.convolve(valid.astype(float), ones, mode='same'), 1), 0)
+    i = int(np.argmax(smooth))
+    near = [j for j in (i-1, i, i+1) if 0 < j < len(changes) and valid[j]]
+    i = max(near, key=lambda j: changes[j])  # the frame the change lands on
+    floor = float(np.median(changes[valid]))
     peak_time = float(shot['start'])+i/FPS
     ramp = edit.get('effects') == 'copper' and copper.motion(shot, k) == 'ramp'
     offsets = copper.ramp_times(frames) if ramp else np.arange(frames)/FPS  # source offset per output frame
     frame = int(np.argmin(np.abs(offsets-i/FPS)))
     info = {'shot': k+1, 'peak': round(peak_time, 3), 'frame': frame, 'frames': frames,
-            'strength': round(float(changes[i]), 4), 'clear': bool(changes[i] >= max(.01, 2*floor)),
+            'strength': round(float(changes[i]), 4), 'typical': round(floor, 4),
+            'clear': bool(changes[i] >= max(MOTION_MIN_CHANGE, MOTION_PEAK_RATIO*floor)),
             'to_cut': round(peak_time, 2)}
     beats = plan_t.get('shot_beats')
     if beats:
@@ -447,9 +460,12 @@ def motion_peak(changes, shot, k, frames, plan_t, edit):
 
 
 def describe_motion(m):
-    text = (f'shot {m["shot"]}: strongest motion at {m["peak"]:.2f} s shows on frame {m["frame"]} of {m["frames"]}'
-            + ('' if m['clear'] else ' (no clear motion: the change barely rises above the rest)')
-            + f'; to put it on the cut, "start": {m["to_cut"]:.2f}')
+    if not m['clear']:
+        return (f'shot {m["shot"]}: no clear motion peak (largest change {m["strength"]*100:.1f} %, typical '
+                f'{m["typical"]*100:.1f} %); its timing is free.')
+    text = (f'shot {m["shot"]}: motion peaks at {m["peak"]:.2f} s ({m["strength"]*100:.1f} % change, typical '
+            f'{m["typical"]*100:.1f} %), on frame {m["frame"]} of {m["frames"]}; to put it on the cut, '
+            f'"start": {m["to_cut"]:.2f}')
     if 'beat_frame' in m:
         text += f'; on the beat at frame {m["beat_frame"]}, "start": {m["to_beat"]:.2f}'
     if 'slow_frame' in m:

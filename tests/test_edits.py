@@ -281,6 +281,21 @@ class MotionTests(unittest.TestCase):
         self.assertNotIn('beat_frame', edits.motion_peak(changes[:15], shot, 0, 15, one, edit()))
         self.assertFalse(edits.motion_peak(np.full(15, .01), shot, 0, 15, one, edit())['clear'])
 
+    def test_repeated_film_frames_are_ignored(self):
+        # 24 fps film on the 30 fps grid: every fifth frame repeats the one before it.
+        t = edits.timeline(CLIP, edit(shots=6, cut_beats=2), WORD, TRACK, SETTINGS)
+        changes = np.full(30, .02)
+        changes[::5] = 0
+        changes[16] = .028          # 1.4x the typical change: not a peak, although the zeros halve the median
+        m = edits.motion_peak(changes, {'start': 50.0}, 0, 30, t, edit())
+        self.assertEqual(.02, m['typical'])
+        self.assertFalse(m['clear'])
+        self.assertIn('no clear motion peak', edits.describe_motion(m))
+        changes[16] = .05
+        changes[15] = 0             # the strongest frame right after a repeat still counts
+        m = edits.motion_peak(changes, {'start': 50.0}, 0, 30, t, edit())
+        self.assertEqual((16, True), (m['frame'], m['clear']))
+
     def test_a_ramp_peak_is_placed_through_the_ramp_curve(self):
         import copper
         styled = edit(shots=6, cut_beats=2, effects='copper')
