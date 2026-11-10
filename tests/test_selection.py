@@ -107,5 +107,28 @@ class SelectionChecks(unittest.TestCase):
         self.assertProblems(data, 600, 'Clip 01 start 11.20 cuts')
 
 
+class EditProblemsDoNotBlockClips(unittest.TestCase):
+    def broken_edit_plan(self):
+        clips = [clip(n, s) for n, s in enumerate([10, 60, 120, 180, 240], 1)]
+        data = plan(clips, [{'start': 0, 'note': 'a'}, {'start': 300, 'note': 'b', 'why_not_more': REASON}])
+        data['edits'] = {'01': {'track': 'missing-track.mp3', 'payoff_word': 3}}
+        return data
+
+    def test_missing_track_is_listed_by_default_but_not_when_edits_are_excluded(self):
+        data = self.broken_edit_plan()
+        with self.assertRaises(ValueError) as caught:
+            check_reviewed_plan(data, 600, transcript(600))
+        self.assertIn('Edit 01', str(caught.exception))
+        check_reviewed_plan(data, 600, transcript(600), include_edits=False)
+
+    def test_clip_problems_still_raise_without_edits(self):
+        data = self.broken_edit_plan()
+        data['clips'][0]['start'] = 11.2
+        with self.assertRaises(ValueError) as caught:
+            check_reviewed_plan(data, 600, transcript(600), include_edits=False)
+        self.assertIn('cuts', str(caught.exception))
+        self.assertNotIn('Edit 01', str(caught.exception))
+
+
 if __name__ == '__main__':
     unittest.main()

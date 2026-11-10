@@ -8,7 +8,7 @@ On macOS/Linux use `./run.sh` wherever `./run.cmd` appears, and `.venv/bin/pytho
 - English Dosis Bold captions centered at `(540,675)`, with word-aligned highlighting.
 - One caption lane: event endings are capped at the next onset, including across sentence boundaries and overlapping ASR segments. The SRT sidecar follows the same rule.
 - A subtle 70 ms entrance fade, 98–100% settling over 100 ms, and up to 40 ms exit fade. The entrance continues across word events instead of restarting on each word.
-- Audio normalized toward -16 LUFS, followed by 20 ms fades at both cut edges. Fades smooth waveform discontinuities; they do not repair words cut in half, so editorial boundaries still matter.
+- Audio normalized to -16 LUFS / -1.5 dBTP in two passes, followed by 20 ms fades at both cut edges. Pass 1 measures the clip's exact range with `loudnorm` (`media_filters.measure_loudness`); pass 2 applies one constant gain, so the dialogue keeps its dynamics (single-pass `loudnorm` runs in Dynamic mode and flattens them). When the target is reachable under the true-peak limit, pass 2 is `loudnorm ... linear=true`. When it is not (a quiet recording with a few loud peaks, typical for dialogue), loudnorm would silently go dynamic, so the clip gets the full gain and `alimiter` (-2 dB ceiling) takes the peaks, but the limiter never works more than 6 dB (`MAX_LIMITED_DB`); a quieter clip ends up below -16 LUFS rather than being squashed. A silent range gets no gain. The measurement is part of the clip's render signature. The clip editor's preview still uses the single-pass chain, since `audio_filters(duration, config)` without a measurement keeps that behaviour. Fades smooth waveform discontinuities; they do not repair words cut in half, so editorial boundaries still matter.
 - No added headings or decorative lines. Existing subtitles burned into the recording remain part of the image.
 
 Settings live in `video_settings.json`. Revised exports use `Output/<source>_<id>/4x5-dosis-speaker-v4/`; previous export profiles and Raw originals remain intact.
@@ -41,7 +41,9 @@ Settings live in `video_settings.json`. Revised exports use `Output/<source>_<id
 
 `--require-reviewed` checks a reviewed plan before it renders anything and lists every problem at once: no clip edge may fall inside a spoken word, and an agent-reviewed plan needs a `coverage` note for every dialogue block of `review.md`, with `why_not_more` for empty blocks and, when there are fewer clips than one per two minutes, for single-clip blocks (AGENTS.md, step 3). Add `--analyze-only` to run only this check. After rendering, it runs `verify_outputs.py` on the output folder and prints the QA sheets and the focus sheets with flagged shots. The editor's Apply skips these agent checks.
 
-A plan with an `edits` block also gets its music edits checked here, and rendered after the clips into `<profile>/edits/` ([docs/edits.md](edits.md)). With `--analyze-only` this includes the montage shots' camera cuts and the montage sheets.
+A plan with an `edits` block also gets its music edits checked here, and rendered after the clips into `<profile>/edits/` ([docs/edits.md](edits.md)). With `--analyze-only` this includes the montage shots' camera cuts and the montage sheets. Edit problems (for example a missing track in `Music/`) never stop the clips: when rendering, the clips are rendered and validated, the edit problems are printed, edits that are fine still render, and the run exits nonzero. `--analyze-only` lists clip and edit problems together.
+
+`--debug` prints the full Python traceback when a source fails; without it only the error message is shown.
 
 A plain run uses keyword/question/speech-density proposals for new sources. This is not equivalent to the model reviewing the full content. Existing plans take precedence on subsequent runs.
 

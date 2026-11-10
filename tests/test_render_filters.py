@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import numpy as np
-from media_filters import video_filters
+from media_filters import audio_filters, video_filters
 from speaker_focus import write_commands
 from shorts import ROOT
 
@@ -31,6 +31,21 @@ class FrameExactRenderTests(unittest.TestCase):
                 self.assertGreater(red,blue+100,f'Wrong focus on frame {i}')
             # A padded/letterboxed output would contain black pixels at edges.
             self.assertGreater(int(output.max(axis=3).min()),150)
+
+
+class AudioChainOrderTests(unittest.TestCase):
+    def test_trim_comes_first_level_in_the_middle_and_fades_last(self):
+        measured={'input_i':-30.0,'input_tp':-20.0,'input_lra':3.0,'input_thresh':-40.0,'target_offset':0.0}
+        for chain in (audio_filters(20,{},measured),audio_filters(20,{})):
+            parts=chain.split(',')
+            self.assertTrue(parts[0].startswith('atrim=duration=20'))
+            self.assertTrue(parts[-1].startswith('afade=t=out'))
+            self.assertLess(chain.index('loudnorm'),chain.index('afade=t=in'))
+
+    def test_measurement_changes_the_chain_so_it_changes_the_render(self):
+        a=audio_filters(20,{},{'input_i':-30.0,'input_tp':-20.0,'input_lra':3.0,'input_thresh':-40.0,'target_offset':0.0})
+        b=audio_filters(20,{},{'input_i':-26.0,'input_tp':-20.0,'input_lra':3.0,'input_thresh':-36.0,'target_offset':0.0})
+        self.assertNotEqual(a,b)
 
 
 if __name__=='__main__':
