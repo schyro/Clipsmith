@@ -115,10 +115,31 @@ def edge_problems(plan, transcript):
     return problems
 
 
-def check_reviewed_plan(plan, duration, transcript):
-    """Raise ValueError listing every problem of a reviewed plan before rendering."""
+def clip_plan_problems(plan, duration, transcript):
+    """Problems that stop the clips from rendering: coverage, clip count and edges inside words."""
     problems = edge_problems(plan, transcript)
     if plan.get('selection') == 'agent-reviewed':
         problems = coverage_problems(plan, duration, transcript)+problems
+    return problems
+
+
+def plan_error(problems):
+    return ValueError('The plan is not ready to render:\n'+'\n'.join(f'  - {p}' for p in problems))
+
+
+def check_reviewed_plan(plan, duration, transcript, include_edits=True):
+    """Raise ValueError listing every problem of a reviewed plan before rendering.
+
+    With include_edits=False only the clip problems count: broken music edits must not keep the
+    source's clips from rendering (the caller reports them with edit_plan_problems)."""
+    problems = clip_plan_problems(plan, duration, transcript)
+    if include_edits:
+        problems += edit_plan_problems(plan, duration, transcript)
     if problems:
-        raise ValueError('The plan is not ready to render:\n'+'\n'.join(f'  - {p}' for p in problems))
+        raise plan_error(problems)
+
+
+def edit_plan_problems(plan, duration, transcript):
+    """Every problem of the plan's music edits found without rendering (empty when there are none)."""
+    from edits import edit_problems
+    return edit_problems(plan, duration, transcript)

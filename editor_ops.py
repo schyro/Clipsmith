@@ -1,11 +1,12 @@
 """Operations behind the clip editor: preview proxy, quick exact preview renders,
-caption word corrections, live-preview data and the ready-to-post export.
+caption word corrections, live-preview data, triage posters and the ready-to-post export.
 
-Long operations also run as a CLI so the editor server can stream their output:
+Long operations also run as a CLI so the editor server can stream their output
+(<model> is the Whisper model the source was transcribed with, see source_model):
     python editor_ops.py proxy <source_id>
-    python editor_ops.py prepare <source_id>          (proxy and missed-speech pass, when missing)
-    python editor_ops.py preview <output folder> <clip id>
-    python editor_ops.py retranscribe <source_id> <start> <end>
+    python editor_ops.py prepare <source_id> <model>          (proxy and missed-speech pass, when missing)
+    python editor_ops.py preview <output folder> <clip id> <model>
+    python editor_ops.py retranscribe <source_id> <start> <end> <model>
 """
 from __future__ import annotations
 import copy
@@ -42,6 +43,27 @@ def proxy_ready(root: Path, source_id):
 
 def preview_dir(root: Path, source_id):
     return review_dir(root, source_id)/'preview'
+
+
+MODELS = ('tiny', 'base', 'small', 'medium', 'large-v3')
+
+
+def source_model(cache: Path, explicit=None):
+    """The Whisper model whose transcript (and caption edits) a source's clips use: the
+    one given, else the one its last render used, else the only transcript in its cache."""
+    if explicit:
+        return explicit
+    cache = Path(cache)
+    try:
+        model = json.loads((cache/'last-render.json').read_text(encoding='utf-8')).get('model')
+        if model:
+            return model
+    except (OSError, ValueError):
+        pass
+    found = [m for m in MODELS if (cache/f'transcript-{m}.json').exists()]
+    if len(found) > 1:
+        raise ValueError(f'{cache} holds transcripts of several models ({", ".join(found)}); pass --model.')
+    return found[0] if found else 'medium'
 
 
 # ---------- captions ----------
@@ -197,21 +219,42 @@ def caption_events(transcript, start, end, config):
 
 # ---------- framing ----------
 
+def centered_focus(source, clip, config):
+    """The fixed crop a clip gets before any speaker analysis: the plan's `crop_x`
+    (centred by default) for every frame, as one shot. Camera cuts are unknown."""
+    import math
+    from shorts import probe
+    from speaker_focus import geometry
+    stream = next(s for s in probe(source)['streams'] if s['codec_type'] == 'video')
+    size = geometry(stream, config)
+    center = (config['width']/2+(size['scaled_width']-config['width'])*clip.get('crop_x', .5))/size['scaled_width']
+    count = max(1, math.ceil((clip['end']-clip['start'])*FPS-1e-9))
+    return {**size, 'frame_count': count, 'shots': [{'start_frame': 0, 'end_frame': count, 'review': []}],
+            'frames': [{'frame': n, 'center_x': center} for n in range(count)]}
+
+
 def auto_focus(source, clip, cache, config, transcript, output=None):
     """Per-frame automatic centers for a clip, without any reviewed overrides, plus
-    the exact shots. Uses the cached analysis; falls back to the rendered .focus.json."""
+    the exact shots. Uses the cached analysis; falls back to the rendered .focus.json,
+    and for a candidate that was never analysed or rendered to a centred crop
+    (`centered`: its shots are unknown, so the editor does not offer framing edits)."""
+    from shorts import clip_stem
     from speaker_focus import analysis_key, focus_plan
     key, _ = analysis_key(clip, config)
+    centered = False
+    rendered = Path(output)/(clip_stem(clip)+'.focus.json') if output else None
     if (Path(cache)/f'speaker-tracks-{key}.json').exists():
         bare = {k: v for k, v in clip.items() if k != 'focus_overrides'}
         plan = focus_plan(source, bare, cache, config, transcript, commands_path=False)
         exact = True
-    else:
-        from shorts import clip_stem
-        plan = json.loads((Path(output)/(clip_stem(clip)+'.focus.json')).read_text(encoding='utf-8'))
+    elif rendered is not None and rendered.exists():
+        plan = json.loads(rendered.read_text(encoding='utf-8'))
         exact = False
+    else:
+        plan = centered_focus(source, clip, config)
+        exact, centered = False, True
     return {'frame_count': plan['frame_count'], 'scaled_width': plan['scaled_width'],
-            'scaled_height': plan['scaled_height'], 'exact': exact,
+            'scaled_height': plan['scaled_height'], 'exact': exact, 'centered': centered,
             'shots': [{'start_frame': s['start_frame'], 'end_frame': s['end_frame'], 'review': s.get('review', [])}
                       for s in plan['shots']],
             'centers': [round(f['center_x'], 4) for f in plan['frames']]}
@@ -296,7 +339,7 @@ def check_proxy_frames(proxy: Path, frames):
         raise RuntimeError(f'The proxy frames do not match the source frames ({len(times)} vs {len(source)}).')
 
 
-def preview_render(root: Path, output: Path, clip_id):
+def preview_render(root: Path, output: Path, clip_id, model=None):
     """Render the exact result of the clip's staged edits at 0.4 scale. It uses the
     real render settings (so the speaker analysis cache matches) and writes only
     into Review/<source>/preview, never into the output folder."""
@@ -306,14 +349,17 @@ def preview_render(root: Path, output: Path, clip_id):
     from shorts import (ROOT, english_transcript, find_source, nvenc_available, probe, run, settings, write_json)
     from speaker_focus import focus_plan
     output = Path(output)
-    clips = {c['id']: c for c in json.loads((output/'clips.json').read_text(encoding='utf-8-sig'))}
+    index = output/'clips.json'
+    clips = {c['id']: c for c in json.loads(index.read_text(encoding='utf-8-sig'))} if index.exists() else {}
+    if clip_id not in clips:
+        raise ValueError(f'Clip {clip_id} has not been rendered yet; keep it in the triage and Apply first.')
     plan = json.loads((output/'plan.json').read_text(encoding='utf-8-sig'))
     source_id = plan['source_id']
     source = find_source(source_id)
     cache = Path(root)/'work'/source_id
     config = settings()
     duration = float(probe(source)['format']['duration'])
-    transcript = english_transcript(source, cache, 'medium')
+    transcript = english_transcript(source, cache, source_model(cache, model))
     words = [w for s in transcript['segments'] for w in s.get('words', [])]
     from frame_grid import load_grid
     from shot_edges import snap_clip_to_cuts
@@ -350,11 +396,13 @@ def preview_render(root: Path, output: Path, clip_id):
 
 
 def export_ready(output: Path, decisions):
-    """Copy approved clips (video and captions) into <output>/ready. Files there
+    """Copy approved clips (video and captions) and approved music edits into <output>/ready. Files there
     that are no longer approved are removed; nothing is published anywhere."""
     output = Path(output)
     approved = {k for k, d in (decisions or {}).get('clips', {}).items() if d.get('status') == 'approved'}
-    clips = [c for c in json.loads((output/'clips.json').read_text(encoding='utf-8-sig')) if c['id'] in approved]
+    index = output/'clips.json'
+    rendered = json.loads(index.read_text(encoding='utf-8-sig')) if index.exists() else []
+    clips = [c for c in rendered if c['id'] in approved]
     folder = output/'ready'
     folder.mkdir(exist_ok=True)
     keep = set()
@@ -362,6 +410,20 @@ def export_ready(output: Path, decisions):
         stem = Path(clip['file']).stem
         for name in (clip['file'], stem+'.en.srt'):
             src = output/name
+            if src.exists():
+                dst = folder/name
+                if not dst.exists() or dst.stat().st_size != src.stat().st_size or dst.stat().st_mtime < src.stat().st_mtime:
+                    shutil.copy2(src, dst)
+                keep.add(name)
+    # Approved music edits: both the music and the no-music file.
+    edits_dir = output/'edits'
+    approved_edits = {k for k, d in (decisions or {}).get('edits', {}).items() if d.get('status') == 'approved'}
+    index = edits_dir/'edits.json'
+    for info in json.loads(index.read_text(encoding='utf-8')) if index.exists() else []:
+        if info['id'] not in approved_edits:
+            continue
+        for name in (info['file'], info['nomusic_file']):
+            src = edits_dir/name
             if src.exists():
                 dst = folder/name
                 if not dst.exists() or dst.stat().st_size != src.stat().st_size or dst.stat().st_mtime < src.stat().st_mtime:
@@ -377,7 +439,7 @@ def retranscribe_path(root: Path, source_id):
     return review_dir(root, source_id)/'retranscribe.json'
 
 
-def retranscribe(root: Path, source_id, start, end):
+def retranscribe(root: Path, source_id, start, end, model=None):
     """Whisper on a short range without VAD, for the editor to propose missed words.
     Writes Review/<id>/retranscribe.json; nothing changes until the user accepts words."""
     from faster_whisper import decode_audio
@@ -387,7 +449,8 @@ def retranscribe(root: Path, source_id, start, end):
     import tempfile
     source = find_source(source_id)
     cache = Path(root)/'work'/source_id
-    original = transcribe(source, cache, 'medium')
+    model = source_model(cache, model)
+    original = transcribe(source, cache, model)
     task = 'transcribe' if original['language'] == 'en' else 'translate'
     language = original.get('source_language') or original['language']
     start, end = max(0.0, float(start)), float(end)
@@ -399,9 +462,9 @@ def retranscribe(root: Path, source_id, start, end):
         subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', str(start), '-i', str(source), '-t', str(end-start),
                         '-vn', '-ar', str(SAMPLE_RATE), '-ac', '1', str(wav)], check=True)
         audio = decode_audio(str(wav), sampling_rate=SAMPLE_RATE)
-    model, _ = load_model('medium')
+    whisper, _ = load_model(model)
     words = []
-    for segment in transcribe_window(model, audio, 0, len(audio)/SAMPLE_RATE, language, task):
+    for segment in transcribe_window(whisper, audio, 0, len(audio)/SAMPLE_RATE, language, task):
         for w in segment.words or []:
             if w.word.strip() and w.end > w.start:
                 words.append({'start': round(start+w.start, 3), 'end': round(start+w.end, 3), 'word': w.word.strip(),
@@ -411,24 +474,52 @@ def retranscribe(root: Path, source_id, start, end):
     return words
 
 
-def prepare(root: Path, source_id):
+def prepare(root: Path, source_id, model=None):
     """What the editor needs once per source: the proxy and the missed-speech pass."""
     from shorts import english_transcript, find_source
     if not proxy_ready(root, source_id):
         make_proxy(root, source_id)
-    english_transcript(find_source(source_id), Path(root)/'work'/source_id, 'medium')
+    cache = Path(root)/'work'/source_id
+    english_transcript(find_source(source_id), cache, source_model(cache, model))
+
+
+def poster_path(root: Path, source_id, clip):
+    """A still for a candidate without a rendered cover, keyed by its cover moment."""
+    at = clip['start']+min(clip.get('cover_time', 2), clip['end']-clip['start']-.1)
+    return review_dir(root, source_id)/'posters'/f'{clip["id"]}-{round(at*1000)}.jpg'
+
+
+def make_poster(root: Path, source_id, clip):
+    """Take the candidate's cover frame from the proxy, cropped to the output's 4:5 at
+    the plan's `crop_x`. Returns the file, or None while there is no proxy."""
+    from shorts import run
+    dest = poster_path(root, source_id, clip)
+    if dest.exists():
+        return dest
+    if not proxy_ready(root, source_id):
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for old in dest.parent.glob(f'{clip["id"]}-*.jpg'):  # an earlier cover moment of the same clip
+        old.unlink()
+    at = clip['start']+min(clip.get('cover_time', 2), clip['end']-clip['start']-.1)
+    x = f'(iw-ih*4/5)*{min(1.0, max(0.0, float(clip.get("crop_x", .5))))}'
+    temp = dest.with_name(dest.stem+'.partial.jpg')
+    run(['ffmpeg', '-v', 'error', '-y', '-ss', f'{at:.3f}', '-i', proxy_path(root, source_id), '-frames:v', '1',
+         '-vf', f'crop=ih*4/5:ih:{x}:0,scale=216:270', '-q:v', '4', temp])
+    temp.replace(dest)
+    return dest
 
 
 def main(argv):
     from shorts import ROOT
     if len(argv) == 2 and argv[0] == 'proxy':
         make_proxy(ROOT, argv[1])
-    elif len(argv) == 2 and argv[0] == 'prepare':
-        prepare(ROOT, argv[1])
-    elif len(argv) == 3 and argv[0] == 'preview':
-        preview_render(ROOT, Path(argv[1]), argv[2])
-    elif len(argv) == 4 and argv[0] == 'retranscribe':
-        retranscribe(ROOT, argv[1], argv[2], argv[3])
+    elif len(argv) in (2, 3) and argv[0] == 'prepare':
+        prepare(ROOT, argv[1], *argv[2:])
+    elif len(argv) in (3, 4) and argv[0] == 'preview':
+        preview_render(ROOT, Path(argv[1]), argv[2], *argv[3:])
+    elif len(argv) in (4, 5) and argv[0] == 'retranscribe':
+        retranscribe(ROOT, argv[1], argv[2], argv[3], *argv[4:])
     else:
         print(__doc__, file=sys.stderr)
         return 2

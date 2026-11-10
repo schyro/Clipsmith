@@ -1,0 +1,55 @@
+{
+  "drop_delay_seconds": 0.25,
+  "drop_delay_range": [0.1, 0.5],
+  "montage_seconds_range": [4.0, 9.0],
+  "cut_interval_range": [0.45, 0.9],
+  "tail_seconds": 0.8,
+  "flash_frames": 3,
+  "music_lufs": -9.0,
+  "bed_below_dialogue_db": 9.0,
+  "bed_check_range_db": [-16.0, -4.0],
+  "music_fade_in_seconds": 0.4,
+  "music_fade_out_seconds": 0.6,
+  "dialogue_fade_ms": 30,
+  "duck": {"threshold": 0.1, "ratio": 2.5, "attack": 20, "release": 400},
+  "limiter": 0.89,
+  "min_drop_gain_db": 6.0,
+  "look": {
+    "levels_strength": 0.6,
+    "low_percentile": 0.5,
+    "high_percentile": 99.5,
+    "curve": "0/0 0.15/0.13 0.4/0.5 0.7/0.8 1/1",
+    "sharpen": 0.45,
+    "clarity": 0.3,
+    "detail": 0.85,
+    "glow": 0.08,
+    "glow_from": 170,
+    "dialogue": true
+  },
+  "grades": {
+    "none": "null",
+    "bw": "hue=s=0",
+    "warm": "eq=saturation=1.25,colorbalance=rs=0.04:bs=-0.04:rm=0.05:bm=-0.05:rh=0.02:bh=-0.03"
+  },
+  "effects": {
+    "none": {},
+    "soft": {"zoom": 0.06, "punch": 0.07, "punch_frames": 3, "shake_px": 0, "flash_every": 4, "flash_frames": 2, "strobe_every": 0, "dialogue_zoom": 0.03},
+    "strong": {"zoom": 0.1, "punch": 0.22, "punch_frames": 4, "shake_px": 26, "flash_every": 4, "flash_frames": 2, "strobe_every": 2, "dialogue_zoom": 0.04},
+    "copper": {
+      "push_zoom": 0.14,
+      "shutter_angle": 90,
+      "flash_opacity": [0.14, 0.05],
+      "final_hold_frames": 4,
+      "tail_seconds": 0.3,
+      "bed_dip_seconds": 0.11,
+      "bed_dip_db": 3.5,
+      "grade": "eq=saturation=0.81,colorbalance=bs=0.027:rs=-0.013:rm=0.014",
+      "look": {"sharpen": 0.24, "detail": 0.45, "clarity": 0.22, "glow": 0.04}
+    }
+  },
+  "transitions": {
+    "cut": null,
+    "white_flash": "white",
+    "black_flash": "black"
+  }
+}

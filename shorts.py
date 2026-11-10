@@ -11,10 +11,12 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import traceback
 from captions import write_captions
 
 ROOT = Path(__file__).resolve().parent
-VERSION = 5
+MODELS = ['tiny','base','small','medium','large-v3']
+VERSION = 6
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.m4v', '.webm'}
 LONG_CLIP_SECONDS = 90  # editorial guideline for short-form clips; 180 s is the hard limit
 
@@ -379,13 +381,13 @@ def clip_stem(clip):
 
 
 # Plan fields that do not change the rendered pixels or sound.
-NON_RENDER_KEYS = {'id','title','reason','approved','cover_time'}
+NON_RENDER_KEYS = {'id','title','reason','approved','kept','cover_time'}
 
 
-def render_signature(clip, config, framing, captions):
+def render_signature(clip, config, framing, captions, loudness=None):
     framing = {k: v for k, v in framing.items() if k != 'commands_path'}
     return hashlib.sha256(json.dumps({'clip':{k: v for k, v in clip.items() if k not in NON_RENDER_KEYS},
-                                      'version':VERSION,'settings':config,'reframe':framing,'captions':captions,
+                                      'version':VERSION,'settings':config,'loudness':loudness,'reframe':framing,'captions':captions,
                                       'font':hashlib.sha256((ROOT/'assets/fonts/Dosis-Bold.ttf').read_bytes()).hexdigest()},
                                      sort_keys=True).encode()).hexdigest()
 
@@ -409,7 +411,11 @@ def render(source, clip, dest, cache, force, transcript=None, config=None):
     from focus_review import write_focus_sheet
     framing = focus_plan(source,clip,cache,config,transcript)
     write_json(dest.with_suffix('.focus.json'),framing)
-    digest = render_signature(clip, config, framing, ass.read_text(encoding='utf-8-sig'))
+    from media_filters import audio_filters, measure_loudness, video_filters
+    duration = clip['end']-clip['start']
+    # First loudnorm pass; the measurement is part of the signature because it sets the clip's gain.
+    loudness = measure_loudness(source, clip['start'], duration)
+    digest = render_signature(clip, config, framing, ass.read_text(encoding='utf-8-sig'), loudness)
     marker = dest.with_suffix('.done.json')
     sheet = ROOT/'Review'/cache.name/'focus'/(dest.stem+'.jpg')
     if not force and dest.exists() and marker.exists() and json.loads(marker.read_text())['signature']==digest:
@@ -420,12 +426,10 @@ def render(source, clip, dest, cache, force, transcript=None, config=None):
         return
     write_focus_sheet(source,clip,framing,sheet,config['width'])
     temp = dest.with_name(dest.stem+'.partial.mp4')
-    duration = clip['end']-clip['start']
-    from media_filters import audio_filters,video_filters
     graph = video_filters(framing,clip,config,ass,ROOT/'assets/fonts')
     command = ['ffmpeg','-hide_banner','-loglevel','error','-y','-ss',clip['start'],'-i',source,
                '-t',duration,'-filter_complex',graph,
-               '-map','[v]','-map','0:a:0','-af',audio_filters(duration,config),
+               '-map','[v]','-map','0:a:0','-af',audio_filters(duration,config,loudness),
                '-c:a','aac','-b:a','192k','-ar','48000','-pix_fmt','yuv420p',
                '-movflags','+faststart','-map_metadata','-1']
     if nvenc_available():
@@ -469,21 +473,26 @@ def tidy_outputs(output, plan):
             print(f'Moved to rejected/: {stem} (no longer in the plan)', flush=True)
 
 
-def output_folder(plan, config):
+def output_name(plan):
     # Named after the plan's original source name, so renaming the Raw file moves nothing.
-    return ROOT/'Output'/(Path(plan['source']).stem+'_'+plan['source_id'][:6])/config['profile']
+    return Path(plan['source']).stem+'_'+plan['source_id'][:6]
 
 
-def snap_plan_to_cuts(source, plan, cache, config, transcript, output, force, plan_path=None):
+def output_folder(plan, config):
+    return ROOT/'Output'/output_name(plan)/config['profile']
+
+
+def snap_plan_to_cuts(source, plan, cache, config, transcript, output, force, plan_path=None, skip=()):
     """Move clip edges off a few frames of a neighbouring camera shot (shot_edges.py).
-    Locked clips keep their edges. A changed plan is written back to `plan_path`."""
+    Locked clips and `skip` (candidates waiting for triage) keep their edges. A changed
+    plan is written back to `plan_path`."""
     from frame_grid import load_grid
     from shot_edges import snap_clip_to_cuts
     grid = load_grid(source, cache)
     words = [w for s in transcript['segments'] for w in s.get('words',[])]
     changed = False
     for number,clip in enumerate(plan['clips']):
-        if is_locked(clip, output/(clip_stem(clip)+'.mp4'), force):
+        if clip['id'] in skip or is_locked(clip, output/(clip_stem(clip)+'.mp4'), force):
             continue
         moved, notes = snap_clip_to_cuts(source,clip,cache,config,words,grid)
         for note in notes:
@@ -496,21 +505,23 @@ def snap_plan_to_cuts(source, plan, cache, config, transcript, output, force, pl
     return changed
 
 
-def render_plan(source, plan, cache, config, force, model='medium', plan_path=None):
-    """Render every clip of a validated plan; return the output folder."""
+def render_plan(source, plan, cache, config, force, model='medium', plan_path=None, skip=()):
+    """Render every clip of a validated plan except `skip` (candidates waiting for the
+    editor's triage, see review_apply.awaiting_triage); return the output folder."""
     output = output_folder(plan, config)
     output.mkdir(parents=True,exist_ok=True)
     index = []
     transcript = english_transcript(source,cache,model)
-    snap_plan_to_cuts(source,plan,cache,config,transcript,output,force,plan_path)
+    snap_plan_to_cuts(source,plan,cache,config,transcript,output,force,plan_path,skip)
     write_json(output/'plan.json',plan)
-    for clip in plan['clips']:
+    clips = [c for c in plan['clips'] if c['id'] not in skip]
+    for clip in clips:
         if clip['end']-clip['start'] > LONG_CLIP_SECONDS:
             print(f'Note: clip {clip["id"]} runs {clip["end"]-clip["start"]:.0f} s. Short-form clips stay within '
                   f'{LONG_CLIP_SECONDS} s unless the user asks for longer (AGENTS.md, step 2).',flush=True)
-    for number,clip in enumerate(plan['clips'],1):
+    for number,clip in enumerate(clips,1):
         dest = output/(clip_stem(clip)+'.mp4')
-        print(f'Clip {number}/{len(plan["clips"])} [{clip["id"]}]: {clip["title"]} ({clip["end"]-clip["start"]:.1f}s)',flush=True)
+        print(f'Clip {number}/{len(clips)} [{clip["id"]}]: {clip["title"]} ({clip["end"]-clip["start"]:.1f}s)',flush=True)
         render(source,clip,dest,cache,force,transcript,config)
         cover = dest.with_suffix('.jpg')
         if not is_locked(clip, dest, force) or not cover.exists():
@@ -520,8 +531,8 @@ def render_plan(source, plan, cache, config, force, model='medium', plan_path=No
     write_json(output/'clips.json',index)
     from gallery import write_gallery
     write_gallery(output,ROOT,index,plan)
+    write_json(cache/'last-render.json',{'profile':config['profile'],'output':str(output),'clips':len(index),'model':model})
     print(f'Completed: {output}',flush=True)
-    write_json(cache/'last-render.json',{'profile':config['profile'],'output':str(output),'clips':len(index)})
     return output
 
 
@@ -534,40 +545,53 @@ def load_plan(plan_path, fingerprint, duration):
 
 
 def main():
+    if '--shots' in sys.argv[1:]:  # shot index: its own options, see shot_index.py
+        import shot_index
+        return shot_index.main([a for a in sys.argv[1:] if a != '--shots'])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, help='Default: all videos in the Raw folder')
     parser.add_argument('--count', type=int, default=None, help='Optional proposal count limit; no fixed limit by default')
-    parser.add_argument('--model', default='medium', choices=['tiny','base','small','medium','large-v3'])
+    parser.add_argument('--model', choices=MODELS, help='Whisper model (default: medium; the editor and --apply-review '
+                        'default to the model the source was transcribed with)')
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--analyze-only', action='store_true')
+    parser.add_argument('--debug', action='store_true', help='Print the full traceback when a source fails')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--prepare-review', action='store_true', help='Prepare the full transcript and timestamped frames for editorial review')
     parser.add_argument('--require-reviewed', action='store_true', help='Require an editorially reviewed plan before rendering')
     parser.add_argument('--review-gallery', nargs='?', const='', metavar='OUTPUT', help='Open the clip editor for an output folder and record decisions (default: latest output folder)')
     parser.add_argument('--write-gallery', nargs='?', const='', metavar='OUTPUT', help='Regenerate only index.html for an output folder (default: latest)')
     parser.add_argument('--apply-review', nargs='?', const='', metavar='OUTPUT', help='Apply gallery decisions to the plan and re-render changed clips (default: latest output folder)')
+    parser.add_argument('--scan-music', action='store_true', help='Detect tempo, beat grid and drop of new tracks in Music/ and list all tracks')
+    parser.add_argument('--no-triage', action='store_true', help='Also render candidates nobody kept in the editor triage yet')
     parser.add_argument('--port', type=int, default=8765, help='Clip editor port')
     parser.add_argument('--no-open', action='store_true', help='Do not open a browser for --review-gallery')
     args = parser.parse_args()
     migrate_all()
+    if args.scan_music:
+        import music
+        music.main()
+        return 0
     if args.apply_review is not None:
         from gallery import latest_output
         from review_apply import apply_review
         output = Path(args.apply_review).resolve() if args.apply_review else latest_output(ROOT)
-        apply_review(output, ROOT, settings(), args.force, args.model)
+        _, _, edit_error = apply_review(output, ROOT, settings(), args.force, args.model)
+        return 1 if edit_error else 0
+    if args.review_gallery is not None:
+        # Opens a plan before anything is rendered too (triage), see docs/clip-editor.md.
+        from editor_server import editor_target, serve
+        output, fingerprint = editor_target(ROOT, args.review_gallery, args.input, settings())
+        serve(ROOT,output,args.port,not args.no_open,args.model,fingerprint)
         return 0
-    if args.review_gallery is not None or args.write_gallery is not None:
+    if args.write_gallery is not None:
         from gallery import latest_output, write_gallery
-        target = args.review_gallery if args.review_gallery is not None else args.write_gallery
-        output = Path(target).resolve() if target else latest_output(ROOT)
+        output = Path(args.write_gallery).resolve() if args.write_gallery else latest_output(ROOT)
         if not (output/'clips.json').exists():
             parser.error(f'No clips.json in {output}')
-        if args.write_gallery is not None:
-            print(f'Gallery written: {write_gallery(output,ROOT)}',flush=True)
-        else:
-            from editor_server import serve
-            serve(ROOT,output,args.port,not args.no_open)
+        print(f'Gallery written: {write_gallery(output,ROOT)}',flush=True)
         return 0
+    args.model = args.model or 'medium'
     if args.count is not None and not 1 <= args.count <= 200:
         parser.error('--count must be between 1 and 200')
     config = settings()
@@ -612,15 +636,61 @@ def main():
             if args.require_reviewed:
                 # Coverage, clip count and word-safe edges; nothing renders until all pass.
                 from selection import check_reviewed_plan
-                check_reviewed_plan(plan,duration,english_transcript(source,cache,args.model))
+                # Edit problems never stop the clips; they are reported and fail the run after the clips.
+                check_reviewed_plan(plan,duration,english_transcript(source,cache,args.model),
+                                    include_edits=args.analyze_only)
             if args.analyze_only:
+                if plan.get('edits'):
+                    # Montage framing and camera cuts need the speaker analysis; show the sheets to review.
+                    from edits import preview_edits
+                    sheets, problems = preview_edits(source,plan,cache,config,english_transcript(source,cache,args.model))
+                    print('Montage sheets (graded and framed as rendered):',flush=True)
+                    for sheet in sheets:
+                        print(f'    {sheet}',flush=True)
+                    if problems:
+                        lines = ''.join(f'\n  - {p}' for p in problems)
+                        raise ValueError(f'The edits are not ready to render:{lines}')
                 print(f'Plan ready: {plan_path}',flush=True)
                 continue
-            output = render_plan(source,plan,cache,config,args.force,args.model,plan_path)
+            from review_apply import awaiting_triage, report_waiting, triage_view
+            # A reviewed plan renders only candidates the user kept in the editor's triage.
+            waiting = awaiting_triage(plan,ROOT) if args.require_reviewed and not args.no_triage else []
+            if waiting and len(waiting) == len(plan['clips']):
+                report_waiting(waiting)
+                continue
+            output = render_plan(source,plan,cache,config,args.force,args.model,plan_path,waiting)
             if args.require_reviewed:
                 from verify_outputs import verify_folder
                 verify_folder(output,config)
+            # Music edits build on the finished, validated clips. A broken edit does not stop the
+            # other edits or the clips, but it fails the run.
+            from edits import render_edits
+            transcript = english_transcript(source,cache,args.model)
+            view = triage_view(plan,waiting)  # edits of candidates waiting for triage are left alone
+            found = []
+            if args.require_reviewed:
+                from selection import edit_plan_problems
+                try:
+                    found = edit_plan_problems(view,duration,transcript)
+                except ValueError as exc:
+                    found = [str(exc)]
+                if found:
+                    print(f'WARNING — {source.name}: the clips are rendered, but the music edits have problems:'
+                          +''.join(f'\n  - {p}' for p in found),file=sys.stderr,flush=True)
+            render_error = None
+            try:
+                render_edits(source,view,cache,config,output,transcript,args.force)
+            except ValueError as exc:
+                render_error = str(exc)
+            report_waiting(waiting)
+            if found:
+                raise ValueError(f'{len(found)} music edit problem(s), listed above; the clips and the other edits are done.'
+                                 +(f'\n{render_error}' if render_error and not all(p in render_error for p in found) else ''))
+            if render_error:
+                raise ValueError(render_error)
         except Exception as exc:
+            if args.debug:
+                traceback.print_exc()
             print(f'ERROR — {source.name}: {exc}',file=sys.stderr,flush=True)
             failures.append(source)
     if args.prepare_review:

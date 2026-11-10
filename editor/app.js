@@ -5,7 +5,8 @@ import htm from 'htm';
 
 const html = htm.bind(h);
 const FPS = 30;
-const STATUS_LABELS = { pending: 'Pending', approved: 'Approved', needs_changes: 'Needs changes', rejected: 'Rejected' };
+const STATUS_LABELS = { pending: 'Pending', kept: 'Kept', approved: 'Approved', needs_changes: 'Needs changes', rejected: 'Rejected' };
+const REASON_KEYS = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9'];
 const CAPTION_EM = 0.82; // CSS em per ASS font size unit for Dosis (libass sizes by line height)
 const MIN_SPAN = 2; // seconds: the closest timeline zoom
 const LOCKED_NOTE = 'Approved clips are read-only. Select Approved again to withdraw the approval.';
@@ -76,7 +77,7 @@ function assColor(value) {
 }
 
 function emptyEntry() {
-  return { status: 'pending', options: [], comment: '', start_shift: 0, end_shift: 0, notes: [] };
+  return { status: 'pending', options: [], comment: '', start_shift: 0, end_shift: 0, notes: [], reasons: [] };
 }
 
 function overridesFor(clip, entry) {
@@ -163,6 +164,7 @@ const ICONS = {
   captions: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 12h4M13 12h4M7 15.5h7"/>',
   review: '<path d="M4 5h16v11H9l-5 4z"/>',
   film: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+  music: '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
   text: '<path d="M4 6h16M4 10h16M4 14h10M4 18h12"/>',
   keyboard: '<rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.5M9.5 10h.5M13 10h.5M16.5 10h.5M7 14h10"/>',
   export: '<path d="M12 15V4M8 8l4-4 4 4"/><path d="M5 13v6h14v-6"/>',
@@ -390,7 +392,7 @@ function wordTitle(w) {
 }
 
 const LANE = { ov: 22, ruler: 22, shots: 34, words: 42, props: 28, notes: 28 };
-const STATUS_COLOR = { pending: 'var(--faint)', approved: 'var(--ok)', needs_changes: 'var(--warn)', rejected: 'var(--bad)' };
+const STATUS_COLOR = { pending: 'var(--faint)', kept: 'var(--accent-hi)', approved: 'var(--ok)', needs_changes: 'var(--warn)', rejected: 'var(--bad)' };
 
 function Timeline({ ctx, t, view, setView, onSeek, onEdge, onEdgeDone, onSelectWord, selectedWord, onWordTiming, threshold,
                     proposals, notes, sourceClips, statusOf, zoomTip }) {
@@ -558,26 +560,50 @@ function LockedLine({ locked }) {
   return locked ? html`<div class="infoline"><${Icon} n="lock" /><span>${LOCKED_NOTE}</span></div>` : null;
 }
 
+// Reject reasons: one click (or a number key right after X) records why a clip was rejected.
+function ReasonCard({ reasons, entry, armed, disabled, onReason, onNext }) {
+  const chosen = entry.reasons || [];
+  return html`<${Card} title="Why reject it?" icon="x" extra=${armed ? 'keys 1–' + reasons.length : 'optional'} cls=${armed ? 'armed' : ''}>
+    <div class="reasons">${reasons.map(([code, label], i) => html`
+      <button class="chip ${chosen.includes(code) ? 'on' : ''}" disabled=${disabled} onClick=${() => onReason(code, false)}
+        title=${chosen.includes(code) ? 'Remove this reason' : 'Add this reason'}><kbd>${i + 1}</kbd>${label}</button>`)}</div>
+    <p class="note">${armed
+      ? html`<kbd>1</kbd>–<kbd>${reasons.length}</kbd> picks a reason and opens the next clip · <kbd>Shift</kbd> + number adds another · <kbd>Enter</kbd> opens the next clip without one.`
+      : 'Click to add or remove a reason. Anything else goes in the comment below.'}</p>
+    <div class="buttons"><button class="btn sm" disabled=${disabled} onClick=${onNext}><${Icon} n="arrow" />Next clip<kbd>Enter</kbd></button></div>
+  </${Card}>`;
+}
+
 function ReviewPanel({ ctx, clip, entry, locked, applying, jobRunning, job, t, onStatus, onApproveNext, onComment, notes, noteDraft,
-                       onDraftNote, onSaveDraft, onEditNote, onDeleteNote, issues, issueIndex, onIssue, onPreview }) {
+                       onDraftNote, onSaveDraft, onEditNote, onDeleteNote, issues, issueIndex, onIssue, onPreview,
+                       reasons, reasonArmed, onReason, onNext }) {
   const draftRef = useRef();
   useEffect(() => { if (noteDraft && draftRef.current) draftRef.current.focus(); }, [noteDraft && noteDraft.t]);
   const rel = (s) => fmt(s - ctx.cut.start);
   const options = (entry.options || []).map(o => html`<span class="opt"><${Icon} n=${o === 'recut' ? 'cut' : 'crop'} />${o === 'recut' ? 'Re-cut' : 'Fix framing'}</span>`);
   const noteKey = (e, save) => { if (e.key === 'Enter') { e.preventDefault(); save(e.target.value); e.target.blur(); } if (e.key === 'Escape') { e.target.blur(); } };
+  const triage = !clip.rendered;
+  const choices = triage ? [['kept', 'Keep', 'check', 'K'], ['needs_changes', 'Needs changes', 'review', 'N'], ['rejected', 'Reject', 'x', 'X']]
+    : [['approved', 'Approve', 'check', 'A'], ['needs_changes', 'Needs changes', 'review', 'N'], ['rejected', 'Reject', 'x', 'X']];
   return html`
     <${Card}>
       <div class="clipttl"><span class="id">${clip.key}</span><h2>${clip.title}</h2><span class="d">${(ctx.cut.end - ctx.cut.start).toFixed(1)} s</span></div>
       <p class="note">${clip.reason}</p>
-      <div class="decide">${[['approved', 'Approve', 'check', 'A'], ['needs_changes', 'Needs changes', 'review', 'N'], ['rejected', 'Reject', 'x', 'X']].map(([v, label, icon, key]) => html`
+      ${triage && html`<div class="infoline triage"><${Icon} n="bolt" /><span>Not rendered yet. It plays from the proxy with live captions${ctx.focus && ctx.focus.centered ? ' and a centred crop (the render follows the speaker)' : ''}.
+        Keep sends it to the render on Apply; until then nothing is rendered.</span></div>`}
+      <div class="decide">${choices.map(([v, label, icon, key]) => html`
         <button data-v=${v} class=${entry.status === v ? 'on' : ''} disabled=${applying} onClick=${() => onStatus(v)} title=${`${STATUS_LABELS[v]} (${key})`}>
           <${Icon} n=${icon} />${label}<kbd>${key}</kbd></button>`)}</div>
       <${LockedLine} locked=${locked} />
       ${entry.addressed && html`<div class="infoline ok"><${Icon} n="check" /><span>Addressed${entry.agent_note ? ': ' + entry.agent_note : ''}</span></div>`}
       <div class="staged">${options.length ? html`Staged: ${options}` : 'Nothing staged for this clip.'}</div>
-      <button class="btn primary wide" disabled=${applying} onClick=${onApproveNext} title="Approve this clip and open the next pending one (Shift+A)">
-        <${Icon} n="done" />Approve and open the next pending clip<kbd>Shift+A</kbd></button>
+      ${triage
+        ? html`<button class="btn primary wide" disabled=${applying} onClick=${onApproveNext} title="Keep this candidate for the render and open the next undecided one (K)">
+            <${Icon} n="done" />Keep and open the next candidate<kbd>K</kbd></button>`
+        : html`<button class="btn primary wide" disabled=${applying} onClick=${onApproveNext} title="Approve this clip and open the next pending clip (Shift+A)">
+            <${Icon} n="done" />Approve and open the next pending clip<kbd>Shift+A</kbd></button>`}
     </${Card}>
+    ${entry.status === 'rejected' && html`<${ReasonCard} reasons=${reasons} entry=${entry} armed=${reasonArmed} disabled=${applying} onReason=${onReason} onNext=${onNext} />`}
     <${Card} title="Comment for the agent" icon="review">
       <textarea class="field" placeholder="What should the editorial agent change? (optional)" value=${entry.comment || ''} disabled=${applying || locked}
         onInput=${e => onComment(e.target.value)}></textarea>
@@ -602,13 +628,94 @@ function ReviewPanel({ ctx, clip, entry, locked, applying, jobRunning, job, t, o
         <span class="txt"><b>${x.label}</b> · ${x.text}</span></button>`)}</div>`
         : html`<p class="note">No flagged shots or doubtful words in this cut.</p>`}
     </${Card}>
-    <${Card}>
+    ${!triage && html`<${Card}>
       <div class="buttons">
         <button class="btn" disabled=${jobRunning} onClick=${onPreview} title="Render the exact result of the staged edits at low resolution">
           <${Icon} n="preview" />${jobRunning && job.kind === 'preview' ? 'Rendering preview…' : 'Render exact preview'}</button>
         <a class="btn" href=${clip.sheet_url} target="_blank"><${Icon} n="grid" />Framing sheet</a>
       </div>
       <p class="note">The exact preview renders the staged edits at 432 × 540 into Review/, never into the output folder.</p>
+    </${Card}>`}`;
+}
+
+// ---------- music edit: watch both versions and decide ----------
+
+const EDIT_CHECKS = { frames: 'Frame count', cuts: 'Cuts on the beat grid', drop_gain_db: 'Drop loudness jump',
+                      bed_db: 'Music under the dialogue', drop_delay: 'Drop after the payoff' };
+
+const num = (v, digits = 2) => (v == null || !isFinite(v) ? '–' : Number(v).toFixed(digits));
+const plusDb = (v) => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(1)} dB`;
+
+function checkText(k, c) {
+  if (k === 'frames') return `${c.found} of ${c.expected}`;
+  if (k === 'cuts') return `${c.exact} of ${c.seen} on their frame (${c.of} cuts${c.unclear.length ? `, ${c.unclear.length} between similar shots` : ''})`;
+  if (k === 'drop_gain_db') return `${plusDb(c.gain)} (at least ${plusDb(c.min)})`;
+  if (k === 'drop_delay') return `${num(c.seconds)} s`;
+  if (k === 'bed_db') return c.level == null ? c.note : `${num(-c.level, 1)} dB under the dialogue`;
+  return '';
+}
+
+function EditPanel({ clip, decision, applying, onSaved, notify }) {
+  const e = clip.edit;
+  const [music, setMusic] = useState(true);
+  const [entry, setEntry] = useState(decision || { status: 'pending', comment: '' });
+  const base = useRef(decision ? decision.updated ?? null : null);
+  const queue = useRef(Promise.resolve());
+  const timer = useRef();
+  useEffect(() => {
+    setEntry(decision || { status: 'pending', comment: '' });
+    base.current = decision ? decision.updated ?? null : null;
+  }, [clip.key]);
+  // Saves run one after another and name the version they were based on.
+  const send = (next) => {
+    queue.current = queue.current.then(async () => {
+      try {
+        const saved = await request(`clips/${encodeURIComponent(clip.key)}/edit-decision`,
+          { status: next.status, comment: next.comment || '', base: base.current });
+        base.current = saved.updated ?? null;
+        onSaved(clip.key, saved);
+      } catch (err) { notify('Not saved: ' + err.message, 'bad'); }
+    });
+  };
+  const setStatus = (s) => { const next = { ...entry, status: entry.status === s ? 'pending' : s }; setEntry(next); send(next); };
+  const setComment = (v) => {
+    const next = { ...entry, comment: v };
+    setEntry(next);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => send(next), 600);
+  };
+  const checks = Object.entries(e.checks || {});
+  return html`
+    <${Card}>
+      <div class="clipttl"><span class="id">${clip.key}</span><h2>Music edit</h2><span class="d">${num(e.duration, 1)} s</span></div>
+      <div class="editvid"><video key=${music ? 'm' : 'd'} src=${music ? e.video_url : e.nomusic_url} poster=${e.poster_url} preload="metadata" playsinline controls></video></div>
+      <div class="seg wide">${[[true, 'With music'], [false, 'Without music']].map(([v, label]) => html`
+        <button class=${music === v ? 'on' : ''} onClick=${() => setMusic(v)}>${label}</button>`)}</div>
+      ${e.reason && html`<p class="note">${e.reason}</p>`}
+      <div class="decide">${[['approved', 'Approve', 'check'], ['needs_changes', 'Needs changes', 'review'], ['rejected', 'Reject', 'x']].map(([v, label, icon]) => html`
+        <button data-v=${v} class=${entry.status === v ? 'on' : ''} disabled=${applying} onClick=${() => setStatus(v)} title=${STATUS_LABELS[v]}>
+          <${Icon} n=${icon} />${label}</button>`)}</div>
+      ${e.locked && html`<div class="infoline"><${Icon} n="lock" /><span>Approved edits are kept. Select Approve again to withdraw the approval.</span></div>`}
+      ${entry.addressed && html`<div class="infoline ok"><${Icon} n="check" /><span>Addressed${entry.agent_note ? ': ' + entry.agent_note : ''}</span></div>`}
+      <p class="note">Rejecting the edit keeps the clip; Apply moves only the edit's files to edits/rejected/.</p>
+    </${Card}>
+    <${Card} title="Comment for the agent" icon="review">
+      <textarea class="field" placeholder="Another track, other montage shots, a different grade… (optional)" value=${entry.comment || ''}
+        disabled=${applying} onInput=${ev => setComment(ev.target.value)}></textarea>
+    </${Card}>
+    <${Card} title="Music" icon="music">
+      <dl class="kv">
+        <dt>Track</dt><dd>${e.track}</dd>
+        <dt>Mood</dt><dd>${e.mood || '—'}</dd>
+        <dt>Tempo</dt><dd>${num(e.bpm, 1)} BPM, a cut every ${num(e.interval, 3)} s, ${e.shots} shots</dd>
+        <dt>Drop</dt><dd>${num(e.drop_at)} s into the edit, after “${e.payoff_text}”</dd>
+        <dt>Look</dt><dd>${e.grade} · ${e.transition.replace('_', ' ')} · ${e.effects || 'soft'} effects</dd>
+      </dl>
+      <p class="note">${e.music_hint}</p>
+    </${Card}>
+    <${Card} title="Checks" icon="flag">
+      <div>${checks.map(([k, c]) => html`<div class="issue check"><${Icon} n=${c.passed ? 'check' : 'alert'} cls=${c.passed ? '' : 'w'} />
+        <span class="txt"><b>${EDIT_CHECKS[k] || k}</b> · ${checkText(k, c)}</span></div>`)}</div>
     </${Card}>`;
 }
 
@@ -641,6 +748,9 @@ function CutPanel({ ctx, t, doShift, disabled, locked }) {
 function FramingPanel({ ctx, frame, editShot, setFraming, overviewSlot, disabled, locked, onSeek }) {
   const { focus, overrides } = ctx;
   if (!focus) return html`<${Card} title="Framing" icon="crop"><p class="note">Loading focus data…</p></${Card}>`;
+  if (focus.centered) return html`<${Card} title="Framing" icon="crop">${overviewSlot}
+    <p class="note">This candidate has no speaker analysis yet, so the live view shows a fixed crop at ${Math.round(focus.centers[0] * 100)}%.
+      The render follows the speaking face; framing can be reviewed once the clip is rendered.</p></${Card}>`;
   const index = shotIndexAt(focus, frame);
   const shot = focus.shots[index];
   const inside = !!shot;
@@ -844,6 +954,7 @@ function App() {
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
   const [entries, setEntries] = useState({});
+  const [editDecisions, setEditDecisions] = useState({});
   const [focusCache, setFocusCache] = useState({});
   const [captions, setCaptions] = useState(null);
   const [snapped, setSnapped] = useState(null);
@@ -875,7 +986,10 @@ function App() {
   const [issueIndex, setIssueIndex] = useState(-1);
   const [noteDraft, setNoteDraft] = useState(null);
   const [playing, setPlaying] = useState(false);
+  const [reasonArmed, setReasonArmed] = useState(null);
   const [, setHistTick] = useState(0);
+  const autoplay = useRef(null); // the clip to play once its captions have loaded
+  const captionSeq = useRef(0);
   const liveVideo = useRef(), fileVideo = useRef(), leftVideo = useRef();
   const overviewDraw = useRef(null);
   const lastFrame = useRef(null);
@@ -906,6 +1020,7 @@ function App() {
       entriesRef.current = clips;
       confirmed.current = Object.fromEntries(Object.entries(clips).map(([k, e]) => [k, e.updated ?? null]));
       setEntries(clips);
+      setEditDecisions(d.decisions.edits || {});
       setJob(d.job);
       setFocusCache({});
       setSelected(s => (s && d.clips.some(c => c.key === s)) ? s : (d.clips[0] && d.clips[0].key));
@@ -943,6 +1058,7 @@ function App() {
   const clip = data && data.clips.find(c => c.key === selected);
   const entry = clip ? { ...emptyEntry(), ...(entries[clip.key] || {}) } : null;
   const locked = !!entry && entry.status === 'approved';
+  const triage = !!clip && !clip.rendered;
   const applying = job && job.state === 'running' && job.kind === 'apply';
   const focus = clip && focusCache[clip.key];
   const cut = clip ? { start: clip.start + (entry.start_shift || 0), end: clip.end + (entry.end_shift || 0) } : null;
@@ -991,9 +1107,14 @@ function App() {
   const capStart = effectiveCut && effectiveCut.start, capEnd = effectiveCut && effectiveCut.end;
   useEffect(() => {
     if (!clip || capStart == null) return;
+    const seq = ++captionSeq.current;
     const timer = setTimeout(() => {
       request(`clips/${encodeURIComponent(clip.key)}/captions?start=${capStart}&end=${capEnd}&context=${wordContext}`)
-        .then(c => { setCaptions(c); setGroupsVersion(v => v + 1); }).catch(e => notify('Captions: ' + e.message, 'bad'));
+        .then(c => {
+          if (seq !== captionSeq.current) return;  // a newer request (another clip or cut) is on its way
+          setCaptions(c); setGroupsVersion(v => v + 1);
+          if (autoplay.current === clip.key) { autoplay.current = null; const v = activeVideo(); if (v) v.play().catch(() => {}); }
+        }).catch(e => notify('Captions: ' + e.message, 'bad'));
     }, 150);
     return () => clearTimeout(timer);
   }, [clip && clip.key, capStart, capEnd, data && data.caption_edits, captionsVersion, wordContext]);
@@ -1016,13 +1137,18 @@ function App() {
     setNoteDraft(null);
     setTimeout(() => seek(firstFrame(clip.start)), 0);
   }, [clip && clip.key, mode]);
+  // Another clip's captions must never show over this one while its own load.
+  useEffect(() => { setCaptions(null); }, [clip && clip.key]);
+  useEffect(() => { if (reasonArmed && (!clip || reasonArmed !== clip.key)) setReasonArmed(null); }, [clip && clip.key]);
+  // A candidate that was never rendered only plays from the proxy.
+  useEffect(() => { if (triage && mode !== 'live') setMode('live'); }, [clip && clip.key, triage]);
   useEffect(() => { setViewState(null); }, [clip && clip.key]);
   // Keep the selected clip visible in the list.
   useEffect(() => { const el = listRef.current && listRef.current.querySelector('li.sel'); if (el) el.scrollIntoView({ block: 'nearest' }); }, [selected, binTab]);
 
   useEffect(() => {
     if (!data) return;
-    if (!data.source.proxy_url && mode === 'live') setMode('rendered');
+    if (!data.source.proxy_url && mode === 'live' && clip && clip.rendered) setMode('rendered');
   }, [data && data.source.id, data && data.source.proxy_url]);
 
   // A zoomed view follows the playhead when it runs past an edge.
@@ -1037,7 +1163,8 @@ function App() {
   // send the newest local state and name the server version they were based on.
   const bodyOf = (e) => {
     const body = { status: e.status, options: e.options || [], comment: e.comment || '',
-                   start_shift: e.start_shift || 0, end_shift: e.end_shift || 0, notes: e.notes || [] };
+                   start_shift: e.start_shift || 0, end_shift: e.end_shift || 0, notes: e.notes || [],
+                   reasons: e.status === 'rejected' ? e.reasons || [] : [] };
     if (e.focus_overrides != null) body.focus_overrides = e.focus_overrides;
     return body;
   };
@@ -1092,7 +1219,8 @@ function App() {
   const snapshotOf = (key) => {
     const e = { ...emptyEntry(), ...(entriesRef.current[key] || {}) };
     return { status: e.status, options: [...(e.options || [])], comment: e.comment || '', start_shift: e.start_shift || 0,
-             end_shift: e.end_shift || 0, focus_overrides: e.focus_overrides ?? null, notes: (e.notes || []).map(n => ({ ...n })) };
+             end_shift: e.end_shift || 0, focus_overrides: e.focus_overrides ?? null, notes: (e.notes || []).map(n => ({ ...n })),
+             reasons: [...(e.reasons || [])] };
   };
   const restoreEntry = (key, snap) => {
     setLocal(key, { ...emptyEntry(), ...(entriesRef.current[key] || {}), ...snap });
@@ -1140,18 +1268,43 @@ function App() {
 
   const setStatus = (status) => {
     if (applying) return;
+    // A candidate that was never rendered is kept, not approved: approval needs the render.
+    if (status === 'approved' && triage) status = 'kept';
+    if (status === 'kept' && !triage) return notify('Keep is for candidates that are not rendered yet; approve a rendered clip.');
     const next = latest().status === status ? 'pending' : status;
-    tracked(`${clip.key}: ${STATUS_LABELS[next]}`, true, () => edit({ status: next }));
+    tracked(`${clip.key}: ${STATUS_LABELS[next]}`, true, () => edit(next === 'rejected' ? { status: next } : { status: next, reasons: [] }));
+    setReasonArmed(next === 'rejected' ? clip.key : null);
+  };
+
+  // The next undecided clip after this one: an unrendered candidate while triaging, else a pending clip.
+  const nextOpen = (key, wantTriage) => {
+    const order = data.clips, i = order.findIndex(c => c.key === key);
+    const open = (c) => ({ ...emptyEntry(), ...(entriesRef.current[c.key] || {}) }).status === 'pending';
+    const rest = [...order.slice(i + 1), ...order.slice(0, i)];
+    return rest.find(c => open(c) && !c.rendered === wantTriage) || rest.find(open);
+  };
+  const openNext = (done) => {
+    const next = nextOpen(clip.key, triage);
+    setReasonArmed(null);
+    // Triage moves on to the next clip and plays it as soon as its captions are in.
+    if (next) { autoplay.current = next.key; setSelected(next.key); }
+    notify(next ? `${done}; opened ${next.key}${next.rendered ? ', the next pending clip' : ', the next candidate'}.` : `${done}. Nothing undecided is left.`, 'ok');
   };
 
   const approveNext = () => {
     if (applying || !clip) return;
-    const key = clip.key;
-    if (latest().status !== 'approved') tracked(`${key}: Approved`, true, () => edit({ status: 'approved' }));
-    const order = data.clips, i = order.findIndex(c => c.key === key);
-    const next = [...order.slice(i + 1), ...order.slice(0, i)].find(c => ({ ...emptyEntry(), ...(entriesRef.current[c.key] || {}) }).status === 'pending');
-    if (next) setSelected(next.key);
-    notify(next ? `Approved ${key}; opened ${next.key}, the next pending clip.` : `Approved ${key}. No pending clips left.`, 'ok');
+    const key = clip.key, status = triage ? 'kept' : 'approved';
+    if (latest().status !== status) tracked(`${key}: ${STATUS_LABELS[status]}`, true, () => edit({ status, reasons: [] }));
+    openNext(`${STATUS_LABELS[status]} ${key}`);
+  };
+
+  // Toggle a reject reason; from a number key it also opens the next clip.
+  const pickReason = (code, advance) => {
+    if (applying || !clip || latest().status !== 'rejected') return;
+    const now = latest().reasons || [];
+    const list = advance && now.includes(code) ? now : now.includes(code) ? now.filter(r => r !== code) : [...now, code];
+    tracked(`${clip.key}: reject reasons`, true, () => edit({ reasons: list }));
+    if (advance) openNext(`Rejected ${clip.key} (${data.reject_reasons.filter(([c]) => list.includes(c)).map(([, l]) => l.toLowerCase()).join(', ')})`);
   };
 
   // An edge can move anywhere in the source; the cut stays between 3 and 180 seconds.
@@ -1434,8 +1587,14 @@ function App() {
       else if (k === 'f') { e.preventDefault(); setBinTab('transcript'); setTimeout(() => { const f = document.getElementById('find-input'); if (f) { f.focus(); f.select(); } }, 0); }
       return;
     }
-    if (e.key === 'Escape') { setHelp(false); setShowHistory(false); setConfirmApply(false); return; }
+    if (e.key === 'Escape') { setHelp(false); setShowHistory(false); setConfirmApply(false); setReasonArmed(null); return; }
     if (!clip || inField || e.altKey) return;
+    // Right after X, number keys pick the reason and Enter moves on without one.
+    if (reasonArmed === clip.key && latest().status === 'rejected') {
+      const r = REASON_KEYS.indexOf((e.code || '').replace('Numpad', 'Digit'));
+      if (r >= 0 && r < data.reject_reasons.length) { e.preventDefault(); pickReason(data.reject_reasons[r][0], !e.shiftKey); return; }
+      if (e.key === 'Enter') { e.preventDefault(); openNext(`Rejected ${clip.key}`); return; }
+    }
     const shots = focus ? focus.shots.map(s => frameTime(s.start_frame)) : [];
     const k = e.key;
     // Live steps through the source's own frames (a render shows some of them twice).
@@ -1452,9 +1611,11 @@ function App() {
       Home: () => seek(firstFrame(effectiveCut.start)), End: () => seek(effectiveCut.end - 1 / FPS),
       l: () => setLoop(v => !v), w: () => { setCtxLevel(v => (v + 1) % CONTEXTS.length); setViewState(null); },
       f: () => { const i = shotIndexAt(focus, frame); if (i >= 0 && framingEditable) { editShotTracked(i, {}, true, true); setTab('framing'); } },
-      a: () => e.shiftKey ? approveNext() : setStatus('approved'), n: () => setStatus('needs_changes'), x: () => setStatus('rejected'),
+      a: () => e.shiftKey || triage ? approveNext() : setStatus('approved'), n: () => setStatus('needs_changes'),
+      k: () => triage ? approveNext() : notify('K keeps a candidate that is not rendered yet; this clip is rendered.'),
+      x: () => latest().status === 'rejected' ? setReasonArmed(clip.key) : setStatus('rejected'),
       m: draftNote, e: () => stepIssue(e.shiftKey ? -1 : 1),
-      1: () => data.source.proxy_url && setMode('live'), 2: () => setMode('rendered'),
+      1: () => data.source.proxy_url && setMode('live'), 2: () => clip.rendered && setMode('rendered'),
       3: () => clip.preview_url && setMode('preview'), 4: () => (clip.history_url || clip.preview_url) && setMode('compare'),
       '?': () => setHelp(v => !v),
     }[k.length === 1 ? k.toLowerCase() : k];
@@ -1467,7 +1628,8 @@ function App() {
   }, []);
 
   const statusOf = (key) => ({ ...emptyEntry(), ...(entries[key] || {}) }).status;
-  const visible = data ? data.clips.filter(c => (filter === 'all' || statusOf(c.key) === filter)
+  const toTriage = (c) => !c.rendered && statusOf(c.key) === 'pending';
+  const visible = data ? data.clips.filter(c => (filter === 'all' || (filter === 'triage' ? toTriage(c) : statusOf(c.key) === filter))
     && (!query.trim() || c.title.toLowerCase().includes(query.trim().toLowerCase()) || c.key.includes(query.trim()))) : [];
   const moveClip = (d) => {
     const list = visible.length ? visible : data.clips;
@@ -1478,13 +1640,17 @@ function App() {
 
   // ----- pending changes for Apply -----
   const pending = useMemo(() => {
-    const groups = { lock: [], withdraw: [], recut: [], framing: [], comment: [], notes: [], remove: [] };
-    if (!data) return { groups, captions: false, total: 0 };
+    const groups = { keep: [], lock: [], withdraw: [], recut: [], framing: [], comment: [], notes: [], drop: [], remove: [] };
+    if (!data) return { groups, captions: false, total: 0, undecided: 0 };
+    let undecided = 0;
     for (const c of data.clips) {
       const e = { ...emptyEntry(), ...(entries[c.key] || {}) };
+      if (!c.rendered && ['kept', 'needs_changes'].includes(e.status)) groups.keep.push(c);
+      if (!c.rendered && e.status === 'pending') undecided++;
+      if (c.rendered && e.status === 'kept') groups.withdraw.push(c);
       if (e.status === 'approved' && !c.locked) groups.lock.push(c);
       if (e.status !== 'approved' && c.locked) groups.withdraw.push(c);
-      if (e.status === 'rejected' && !e.addressed) groups.remove.push(c);
+      if (e.status === 'rejected' && !e.addressed) (c.rendered ? groups.remove : groups.drop).push(c);
       if (e.status === 'needs_changes' && !e.addressed) {
         if (e.focus_overrides != null) groups.framing.push(c);
         if ((e.options || []).includes('recut') && (e.start_shift || e.end_shift)) groups.recut.push(c);
@@ -1493,7 +1659,7 @@ function App() {
       }
     }
     const total = Object.values(groups).reduce((n, g) => n + g.length, 0) + (data.captions_dirty ? 1 : 0);
-    return { groups, captions: !!data.captions_dirty, total };
+    return { groups, captions: !!data.captions_dirty, total, undecided };
   }, [data, entries]);
 
   const runApply = async () => {
@@ -1522,9 +1688,9 @@ function App() {
   };
   ctx.cut = effectiveCut ? { ...effectiveCut } : cut;
   const timelineCtx = { ...ctx, cut, snapped };
-  const counts = { all: data.clips.length, pending: 0, approved: 0, needs_changes: 0, rejected: 0 };
-  data.clips.forEach(c => counts[statusOf(c.key)]++);
-  const decided = counts.approved + counts.needs_changes + counts.rejected;
+  const counts = { all: data.clips.length, triage: 0, pending: 0, kept: 0, approved: 0, needs_changes: 0, rejected: 0 };
+  data.clips.forEach(c => { counts[statusOf(c.key)]++; if (toTriage(c)) counts.triage++; });
+  const decided = counts.kept + counts.approved + counts.needs_changes + counts.rejected;
   const pct = (n) => (counts.all ? n / counts.all * 100 : 0) + '%';
   const hasPreview = !!clip.preview_url;
   const previewStale = hasPreview && clip.preview && entry.updated && clip.preview.decision_updated !== entry.updated;
@@ -1539,7 +1705,7 @@ function App() {
       : html`<div class="viewport empty"><p>The live preview needs a low-resolution proxy that keeps the source's own frames.</p>
           ${jobRunning && (job.kind === 'proxy' || job.kind === 'prepare') ? html`<p>Creating it… ${job.progress != null ? Math.round(job.progress * 100) + '%' : ''}</p>`
             : html`<button class="btn primary" disabled=${jobRunning} onClick=${runProxy}>Create proxy</button>`}</div>`;
-  } else if (mode === 'rendered') {
+  } else if (mode === 'rendered' && clip.rendered) {
     stageView = html`<${FileVideo} src=${clip.video_url} videoRef=${fileVideo} onTime=${setT} offset=${clip.start} label="Rendered" />`;
   } else if (mode === 'preview') {
     stageView = html`<${FileVideo} src=${clip.preview_url} videoRef=${fileVideo} onTime=${setT} offset=${clip.preview ? clip.preview.start : clip.start} label=${previewStale ? 'Preview (older than the latest edit)' : 'Preview render'} />`;
@@ -1561,11 +1727,15 @@ function App() {
     return null;
   };
   let inspector;
-  if (tab === 'review') {
+  if (tab === 'edit' && clip.edit) {
+    inspector = html`<${EditPanel} clip=${clip} decision=${editDecisions[clip.key]} applying=${applying} notify=${notify}
+      onSaved=${(key, saved) => setEditDecisions(m => ({ ...m, [key]: saved }))} />`;
+  } else if (tab === 'review' || tab === 'edit') {
     inspector = html`<${ReviewPanel} ctx=${ctx} clip=${clip} entry=${entry} locked=${locked} applying=${applying} jobRunning=${jobRunning} job=${job} t=${t}
       onStatus=${setStatus} onApproveNext=${approveNext} onComment=${v => edit({ comment: v }, false)} notes=${notes} noteDraft=${noteDraft && noteDraft.key === clip.key ? noteDraft : null}
       onDraftNote=${draftNote} onSaveDraft=${saveDraftNote} onEditNote=${editNote} onDeleteNote=${deleteNote}
-      issues=${issues} issueIndex=${issueIndex} onIssue=${openIssue} onPreview=${runPreview} />`;
+      issues=${issues} issueIndex=${issueIndex} onIssue=${openIssue} onPreview=${runPreview}
+      reasons=${data.reject_reasons} reasonArmed=${reasonArmed === clip.key} onReason=${pickReason} onNext=${() => openNext(`${STATUS_LABELS[entry.status]} ${clip.key}`)} />`;
   } else if (tab === 'cut') {
     inspector = html`<${CutPanel} ctx=${ctx} t=${t} doShift=${doShift} disabled=${locked || applying} locked=${locked} />`;
   } else if (tab === 'framing') {
@@ -1583,6 +1753,8 @@ function App() {
   const G = pending.groups;
   const group = (list, title, icon, extra) => list.length ? html`<div class="pg"><div class="pgh"><${Icon} n=${icon} />${title}<span class="x">${list.length}</span></div>
     <div class="items">${list.map(c => html`<span class="it"><b>${c.key}</b>${c.title}${extra ? extra(c) : ''}</span>`)}</div></div>` : null;
+  const reasonText = (c) => { const r = (entries[c.key] || {}).reasons || [];
+    return r.length ? ` (${data.reject_reasons.filter(([k]) => r.includes(k)).map(([, l]) => l.toLowerCase()).join(', ')})` : ' (no reason)'; };
   const shifts = (c) => { const e = { ...emptyEntry(), ...(entries[c.key] || {}) };
     return ` (${[e.start_shift ? 'start ' + signed(e.start_shift) : '', e.end_shift ? 'end ' + signed(e.end_shift) : ''].filter(Boolean).join(', ')})`; };
 
@@ -1592,8 +1764,8 @@ function App() {
       <div class="brand"><svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><rect x="1" y="1" width="20" height="20" rx="5" fill="var(--accent)"/>
         <rect x="7" y="5" width="8" height="10" rx="1.5" fill="none" stroke="#fff" stroke-width="1.8"/><path d="M5 18h12" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/></svg>Clipsmith</div>
       <div class="crumb"><b>${data.source.name}</b><${Icon} n="right" /><span>${data.profile}</span></div>
-      <div class="progress" title=${`${counts.approved} approved, ${counts.needs_changes} need changes, ${counts.rejected} rejected, ${counts.pending} pending`}>
-        <span class="pbar"><i style=${{ width: pct(counts.approved), background: 'var(--ok)' }}></i><i style=${{ width: pct(counts.needs_changes), background: 'var(--warn)' }}></i>
+      <div class="progress" title=${`${counts.kept} kept, ${counts.approved} approved, ${counts.needs_changes} need changes, ${counts.rejected} rejected, ${counts.pending} pending`}>
+        <span class="pbar"><i style=${{ width: pct(counts.kept), background: 'var(--accent-hi)' }}></i><i style=${{ width: pct(counts.approved), background: 'var(--ok)' }}></i><i style=${{ width: pct(counts.needs_changes), background: 'var(--warn)' }}></i>
           <i style=${{ width: pct(counts.rejected), background: 'var(--bad)' }}></i></span>
         <span><b>${decided}</b> of ${counts.all} decided</span></div>
       <span class="sp"></span>
@@ -1620,7 +1792,7 @@ function App() {
           ${job.kind}: ${job.state}${job.state === 'running' && job.progress != null ? ` ${Math.round(job.progress * 100)}%` : ''}
           ${job.state === 'running' && job.progress != null && html`<span class="bar"><i style=${{ width: job.progress * 100 + '%' }}></i></span>`}</button>`}
         <button class="btn ghost" onClick=${runExport} title="Copy approved clips to the ready folder"><${Icon} n="export" />Export approved</button>
-        <a class="btn ghost" href=${data.gallery_url} target="_blank" title="Read-only overview of the output folder"><${Icon} n="grid" />Overview</a>
+        ${data.gallery_url && html`<a class="btn ghost" href=${data.gallery_url} target="_blank" title="Read-only overview of the output folder"><${Icon} n="grid" />Overview</a>`}
         <button class="btn icon ghost" onClick=${() => setHelp(v => !v)} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts"><${Icon} n="keyboard" /></button>
         <button class="btn primary" disabled=${jobRunning || !pending.total} onClick=${() => setConfirmApply(true)}><${Icon} n="check" />Apply${pending.total ? ` (${pending.total})` : ''}</button>
       </div>
@@ -1633,16 +1805,20 @@ function App() {
       </div>
       <div class="binbody">${binTab === 'clips' ? html`
         <div class="search"><input class="field" placeholder="Search clips by title or id" value=${query} onInput=${e => setQuery(e.target.value)} /></div>
-        <div class="filters">${Object.entries({ all: 'All', ...STATUS_LABELS }).map(([k, label]) => html`
+        <div class="filters">${Object.entries({ all: 'All', ...(counts.triage || filter === 'triage' ? { triage: 'To triage' } : {}), ...STATUS_LABELS })
+          .filter(([k]) => k !== 'kept' || counts.kept || filter === 'kept').map(([k, label]) => html`
           <button class="chip ${filter === k ? 'on' : ''}" onClick=${() => setFilter(k)}>${label} <b>${counts[k]}</b></button>`)}</div>
         <ul class="clips" ref=${listRef}>${visible.map(c => {
           const e = { ...emptyEntry(), ...(entries[c.key] || {}) };
           const staged = e.status === 'needs_changes' && !e.addressed && (e.focus_overrides != null || e.start_shift || e.end_shift);
           return html`<li class=${c.key === selected ? 'sel' : ''} onClick=${() => setSelected(c.key)}>
-            <img src=${c.poster_url} alt="" loading="lazy" />
+            <img src=${c.poster_url} alt="" loading="lazy" onError=${ev => { ev.target.style.visibility = 'hidden'; }} />
             <div style=${{ minWidth: 0 }}><div class="title"><span class="num">${c.key}</span>${c.title}</div>
               <div class="meta"><span class="badge st-${e.status}">${STATUS_LABELS[e.status]}</span><span class="mono">${(c.end - c.start).toFixed(1)} s</span>
+                ${!c.rendered && html`<span class="mk-unrendered" title="Not rendered yet: triage it from the proxy">not rendered</span>`}
+                ${e.status === 'rejected' && (e.reasons || []).length > 0 && html`<span class="muted" title=${data.reject_reasons.filter(([k]) => e.reasons.includes(k)).map(([, l]) => l).join(', ')}><${Icon} n="x" />${e.reasons.length}</span>`}
                 ${c.locked && html`<span class="mk-locked" title="Locked: the approved file is kept"><${Icon} n="lock" /></span>`}
+                ${c.edit && html`<span class=${`mk-edit st-${(editDecisions[c.key] || {}).status || 'pending'}`} title=${`Music edit: ${STATUS_LABELS[(editDecisions[c.key] || {}).status || 'pending']}`}><${Icon} n="music" /></span>`}
                 ${staged && html`<span class="mk-staged" title="Staged cut or framing edits">●</span>`}
                 ${(e.notes || []).length > 0 && html`<span class="muted" title=${`${e.notes.length} note(s) for the agent`}><${Icon} n="pin" /></span>`}
                 ${e.addressed && html`<span class="mk-addr" title="Addressed by the agent"><${Icon} n="check" /></span>`}</div></div></li>`;
@@ -1658,7 +1834,7 @@ function App() {
     <main class="panel mon">
       <div class="monhead">
         <div class="seg">
-          ${[['live', 'Live', 'bolt', !!data.source.proxy_url || true], ['rendered', 'Rendered', 'film', true], ['preview', 'Preview', 'preview', hasPreview],
+          ${[['live', 'Live', 'bolt', !!data.source.proxy_url || true], ['rendered', 'Rendered', 'film', !!clip.rendered], ['preview', 'Preview', 'preview', hasPreview],
              ['compare', 'Compare', 'compare', !!(clip.history_url || clip.preview_url)]].map(([k, label, icon, ok], i) => html`
             <button class=${mode === k ? 'on' : ''} disabled=${!ok} onClick=${() => setMode(k)} title=${`Shortcut: ${i + 1}`}><${Icon} n=${icon} />${label}<kbd>${i + 1}</kbd></button>`)}
         </div>
@@ -1682,7 +1858,8 @@ function App() {
     </main>
 
     <aside class="panel insp">
-      <div class="ptabs">${[['review', 'Review', 'review'], ['cut', 'Cut', 'cut'], ['framing', 'Framing', 'crop'], ['captions', 'Captions', 'captions']].map(([k, label, icon]) => html`
+      <div class="ptabs">${[['review', 'Review', 'review'], ['cut', 'Cut', 'cut'], ['framing', 'Framing', 'crop'], ['captions', 'Captions', 'captions'],
+                            ...(clip.edit ? [['edit', 'Edit', 'music']] : [])].map(([k, label, icon]) => html`
         <button class="ptab ${tab === k ? 'on' : ''}" onClick=${() => setTab(k)}><${Icon} n=${icon} />${label}${tabDot(k)}</button>`)}</div>
       <div class="ibody">${inspector}</div>
     </aside>
@@ -1717,15 +1894,19 @@ function App() {
       <pre>${(job.log || []).join('\n') || 'No output yet.'}</pre></div>`}
     ${confirmApply && html`<div class="modal" onClick=${() => setConfirmApply(false)}><div class="dialog" onClick=${e => e.stopPropagation()}>
       <div class="dh"><h3>Apply ${pending.total} change${pending.total === 1 ? '' : 's'}?</h3>
-        <p>The plan is updated and changed clips are re-rendered. Approved clips stay locked. Comments and notes stay open for the agent.</p></div>
+        <p>The plan is updated and changed clips are re-rendered. Kept candidates are rendered at full quality and come back as pending.
+          Approved clips stay locked. Comments and notes stay open for the agent.</p></div>
       <div class="db">
+        ${pending.undecided > 0 && html`<div class="infoline"><${Icon} n="alert" /><span>${pending.undecided} candidate${pending.undecided === 1 ? ' is' : 's are'} not decided yet; ${pending.undecided === 1 ? 'it stays' : 'they stay'} in the plan and ${pending.undecided === 1 ? 'is' : 'are'} not rendered.</span></div>`}
+        ${group(G.keep, 'Render kept candidates', 'film')}
+        ${group(G.drop, 'Reject candidates (never rendered)', 'x', reasonText)}
         ${group(G.lock, 'Lock approved clips', 'lock')}
         ${group(G.withdraw, 'Withdraw approval', 'restore')}
         ${group(G.recut, 'Re-cut on word boundaries', 'cut', shifts)}
         ${group(G.framing, 'Apply reviewed framing', 'crop', c => ` (${(({ ...emptyEntry(), ...(entries[c.key] || {}) }).focus_overrides || []).length} override(s))`)}
         ${group(G.comment, 'Comment for the agent', 'review')}
         ${group(G.notes, 'Timeline notes for the agent', 'pin', c => ` (${(entries[c.key].notes || []).length})`)}
-        ${group(G.remove, 'Move rejected clips to rejected/', 'x')}
+        ${group(G.remove, 'Move rejected clips to rejected/', 'x', reasonText)}
         ${pending.captions && html`<div class="pg"><div class="pgh"><${Icon} n="captions" />Re-render clips with corrected captions<span class="x">1</span></div>
           <div class="items"><span class="it">${data.caption_edits} caption edit(s) in this source</span></div></div>`}
       </div>
@@ -1738,6 +1919,8 @@ function App() {
         ['Space', 'Play or pause the cut'], ['← / →', 'One frame (Shift: one second)'], ['I / O', 'Set start / end at the playhead'],
         ['[ / ]', 'Previous / next camera cut'], ['Home / End', 'Start / end of the cut'], ['↑ / ↓', 'Previous / next clip'],
         ['F', 'Override the framing of the current shot'], ['A / N / X', 'Approve / needs changes / reject'], ['Shift+A', 'Approve and open the next pending clip'],
+        ['K', 'Keep a candidate that is not rendered yet and open the next one (A does the same there)'],
+        ['1–6 after X', 'Pick the reject reason and open the next clip (Shift: add another reason)'], ['Enter after X', 'Next clip without a reason'],
         ['M', 'Pin a note for the agent at the playhead'], ['E / Shift+E', 'Next / previous flagged shot or doubtful word'],
         ['1–4', 'Live / rendered / preview / compare'], ['L', 'Loop'], ['W', 'Timeline context: ±3 s, ±30 s, ±2 min, ±10 min'],
         ['Ctrl + wheel', 'Zoom the timeline around the cursor (the wheel alone scrolls it)'], ['Ctrl+Z / Ctrl+Shift+Z', 'Undo / redo'],

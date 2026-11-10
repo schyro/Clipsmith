@@ -10,6 +10,7 @@ Simply drop your video into `Raw/`. Clipsmith finds the best 20–60 second mome
 - **Word-by-word highlighted captions**, transcribed locally with Whisper.
 - **Clean cuts** that never split a word or flash a few frames of the neighbouring camera shot, with loudness normalisation and soft audio fades.
 - **A clip editor in your browser** to approve or reject clips, move edges, fix framing and correct caption words.
+- **Music edits** of the clips you choose: the dialogue up to the payoff line, a drop on your own music, and a black-and-white or warm montage cut on every beat. Each edit comes with and without the music.
 
 ## Requirements
 
@@ -41,6 +42,7 @@ The agent follows [AGENTS.md](AGENTS.md). It prepares transcripts, chooses the c
 ./run.cmd --require-reviewed   # render clips from the agent's reviewed plans
 ./run.cmd --review-gallery     # open the clip editor
 ./run.cmd --apply-review       # apply your editor decisions
+./run.cmd --scan-music         # detect tempo and drop of the tracks in Music/
 ```
 
 A plain `./run.cmd` with no options picks clips with a simple keyword heuristic. It is a rough fallback; the agent does a far better job.
@@ -49,7 +51,7 @@ A plain `./run.cmd` with no options picks clips with a simple keyword heuristic.
 
 ![The Clipsmith clip editor](docs/images/clip-editor.png)
 
-`./run.cmd --review-gallery` opens the editor in its own window (`http://127.0.0.1:8765/editor/`). For each clip you can:
+`./run.cmd --review-gallery` opens the editor in its own window (`http://127.0.0.1:8765/editor/`). The agent's candidates come first, before anything is rendered: play each from a low-resolution preview with live captions, then keep it (K) or reject it (X, then a number for the reason). Apply renders only the kept ones. For each rendered clip you can:
 
 - approve it, reject it or ask for changes, with a comment or notes pinned to moments on the timeline
 - move the start and end (cuts snap to word boundaries)
@@ -69,6 +71,7 @@ Output size, caption font, size, position and colour, fades and speaker-switch t
 
 - [docs/framing.md](docs/framing.md): how speaker framing works, and the plan file format
 - [docs/clip-editor.md](docs/clip-editor.md): the editor and the review decisions file
+- [docs/edits.md](docs/edits.md): music edits, the `Music/` sidecars and the edit checks
 - [docs/reference.md](docs/reference.md): all commands, caption corrections, caching and tests
 - [examples/plan.example.json](examples/plan.example.json): an example clip plan
 
